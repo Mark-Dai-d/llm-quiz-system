@@ -1,18 +1,30 @@
-const BASE_BANK = window.QUESTION_BANK || [];
-const BASE_META = window.QUESTION_META || {};
-const KNOWLEDGE_SUMMARY = window.KNOWLEDGE_SUMMARY || [];
-const CONFUSION_POINTS = window.CONFUSION_POINTS || [];
-const SOURCE_REFERENCES = window.SOURCE_REFERENCES || [];
-
-const STORAGE = {
-  users: "llm_quiz_users_v1",
-  session: "llm_quiz_session_v1",
-  bankOverride: "llm_quiz_bank_override_v1",
-  userData: (username) => `llm_quiz_data_v1_${username}`,
-  quiz: (username) => `llm_quiz_active_round_v1_${username}`,
+const META = window.QUESTION_META || {};
+const SCHEMA = window.QUESTION_SCHEMA || {
+  difficultyLayers: ["基础层", "进阶层", "冲刺层"],
+  questionTypes: ["单选", "多选", "判断", "简答"],
 };
 
-const REVIEW_INTERVALS = [6, 24, 72, 168, 360].map((h) => h * 60 * 60 * 1000);
+const STORAGE = {
+  users: "llm_quiz_users_v2",
+  session: "llm_quiz_session_v2",
+  bankOverride: "llm_quiz_bank_override_v2",
+  data: (username) => `llm_quiz_learning_v2_${username}`,
+  round: (username) => `llm_quiz_round_v2_${username}`,
+};
+
+const DIFFICULTY_COLORS = {
+  基础层: "layer-basic",
+  进阶层: "layer-advanced",
+  冲刺层: "layer-sprint",
+};
+
+function esc(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
 
 function readJson(key, fallback) {
   try {
@@ -27,139 +39,135 @@ function writeJson(key, value) {
   localStorage.setItem(key, JSON.stringify(value));
 }
 
-function esc(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-function compactText(value, length = 70) {
-  const text = String(value || "");
-  return text.length > length ? `${text.slice(0, length)}...` : text;
-}
-
-function unique(items) {
-  return [...new Set(items)];
-}
-
 function nowIso() {
   return new Date().toISOString();
 }
 
-function formatTime(value) {
+function fmtTime(value) {
   if (!value) return "-";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "-";
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
-function formatDate(value) {
+function fmtDate(value) {
   if (!value) return "-";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "-";
   return d.toLocaleDateString("zh-CN");
 }
 
+function compact(value, size = 86) {
+  const text = String(value || "");
+  return text.length > size ? `${text.slice(0, size)}...` : text;
+}
+
+function uniq(items) {
+  return [...new Set(items)];
+}
+
 function randomId() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function normalizeBank(items) {
-  const root = BASE_META.root || "大模型应用技术省赛";
-  return (items || []).map((q, index) => {
-    const id = Number(q.id) || index + 1;
-    const path = Array.isArray(q.path) && q.path.length
-      ? q.path
-      : [root, q.layer || "未分层", q.moduleName || "未分模块", q.topic || "未归类考点"];
-    return {
-      ...q,
-      id,
-      type: q.type || "single",
-      typeLabel: q.typeLabel || "单选",
-      options: q.options || {},
-      answerLetters: q.answerLetters || [],
-      tags: q.tags || [],
-      path,
-      pathKey: q.pathKey || path.join(" / "),
-      autoScore: q.autoScore !== false && q.type !== "essay",
-    };
-  });
+function normalizeQuestion(q, index) {
+  const difficultyLayer = q.difficultyLayer || q.layer || "基础层";
+  const categoryPath = Array.isArray(q.categoryPath) && q.categoryPath.length
+    ? q.categoryPath
+    : Array.isArray(q.path)
+      ? q.path.filter((x) => !SCHEMA.difficultyLayers.includes(x)).slice(-2)
+      : [q.moduleName || "未分模块", q.topic || "未归类"];
+  const questionType = q.questionType || q.typeLabel || "单选";
+  return {
+    ...q,
+    id: Number(q.id) || index + 1,
+    difficultyLayer,
+    categoryPath,
+    categoryKey: q.categoryKey || categoryPath.join(" / "),
+    questionType,
+    options: q.options || {},
+    answerLetters: q.answerLetters || [],
+    answerText: q.answerText || "",
+    explanation: q.explanation || "",
+    tags: q.tags || [],
+    autoScore: questionType !== "简答",
+  };
 }
 
 function loadBank() {
   const override = readJson(STORAGE.bankOverride, null);
-  if (override && Array.isArray(override.questions) && override.questions.length) {
-    return normalizeBank(override.questions);
-  }
-  return normalizeBank(BASE_BANK);
+  const source = override?.questions?.length ? override.questions : (window.QUESTION_BANK || []);
+  return source.map(normalizeQuestion);
 }
 
 let BANK = loadBank();
-let QUESTION_MAP = new Map();
-let HIERARCHY = null;
-let NODE_MAP = new Map();
+let QMAP = new Map();
+let CATEGORY_TREES = {};
+let CATEGORY_NODE_MAP = new Map();
 
-function safeNodeId(parts) {
-  if (!parts.length) return "root";
-  return parts.join("::").replace(/[^\w\u4e00-\u9fff-]+/g, "-").replace(/^-+|-+$/g, "") || "root";
+function nodeId(layer, path) {
+  return `${layer || "全部难度"}::${path.join("::") || "all"}`.replace(/[^\w\u4e00-\u9fff:-]+/g, "-");
 }
 
-function addTreePath(root, path, questionId) {
+function emptyRoot(layer) {
+  return { id: nodeId(layer, []), layer, name: layer || "全部分类", path: [], questionIds: [], children: [] };
+}
+
+function addCategory(root, layer, path, qid) {
   let current = root;
-  current.questionIds.push(questionId);
+  current.questionIds.push(qid);
   const parts = [];
   for (const name of path) {
     parts.push(name);
-    let child = current.children.find((item) => item.name === name);
+    let child = current.children.find((n) => n.name === name);
     if (!child) {
-      child = { id: safeNodeId(parts), name, path: parts.slice(), questionIds: [], children: [] };
+      child = { id: nodeId(layer, parts), layer, name, path: parts.slice(), questionIds: [], children: [] };
       current.children.push(child);
     }
-    child.questionIds.push(questionId);
+    child.questionIds.push(qid);
     current = child;
   }
 }
 
 function indexBank() {
-  const rootName = BASE_META.root || "大模型应用技术省赛";
-  const root = { id: "root", name: rootName, path: [rootName], questionIds: [], children: [] };
-  QUESTION_MAP = new Map(BANK.map((q) => [Number(q.id), q]));
+  QMAP = new Map(BANK.map((q) => [q.id, q]));
+  CATEGORY_TREES = { 全部难度: emptyRoot("全部难度") };
+  for (const layer of SCHEMA.difficultyLayers) CATEGORY_TREES[layer] = emptyRoot(layer);
   for (const q of BANK) {
-    const parts = q.path[0] === rootName ? q.path.slice(1) : q.path;
-    addTreePath(root, parts, q.id);
+    addCategory(CATEGORY_TREES[q.difficultyLayer], q.difficultyLayer, q.categoryPath, q.id);
+    addCategory(CATEGORY_TREES["全部难度"], "全部难度", q.categoryPath, q.id);
   }
-  HIERARCHY = root;
-  NODE_MAP = new Map();
-  (function walk(node) {
-    node.questionIds = unique(node.questionIds.map(Number));
-    NODE_MAP.set(node.id, node);
+  CATEGORY_NODE_MAP = new Map();
+  function walk(node) {
+    node.questionIds = uniq(node.questionIds.map(Number));
+    node.children.sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+    CATEGORY_NODE_MAP.set(node.id, node);
     node.children.forEach(walk);
-  })(HIERARCHY);
+  }
+  Object.values(CATEGORY_TREES).forEach(walk);
 }
 
 indexBank();
 
 const state = {
   user: null,
-  authTab: "login",
   view: "dashboard",
+  authTab: "login",
   error: "",
   toast: "",
-  expandedNodes: new Set(["root", ...(HIERARCHY.children || []).map((n) => n.id)]),
-  selectedNodeIds: new Set(["root"]),
-  reviewNodeIds: new Set(["root"]),
-  wrongNodeIds: new Set(["root"]),
-  practiceMode: "hierarchy",
-  randomSource: "all",
+  selectedDifficulty: "全部难度",
+  selectedTypes: new Set(SCHEMA.questionTypes),
+  selectedCategoryIds: new Set(["all"]),
+  expandedCategoryIds: new Set(Object.values(CATEGORY_TREES).map((n) => n.id)),
+  mode: "hierarchy",
+  randomMixed: true,
   excludeMastered: false,
   favoriteOnly: false,
-  practiceCount: 10,
+  count: 10,
   customCount: "",
-  quiz: null,
+  round: null,
   noteEditorId: null,
-  insightScope: "selected",
+  insightScope: "filtered",
 };
 
 window.state = state;
@@ -167,12 +175,10 @@ window.state = state;
 const nav = [
   ["dashboard", "首页"],
   ["practice", "刷题训练"],
-  ["review", "今日复习"],
   ["wrongbook", "错题本"],
   ["favorites", "我的收藏"],
   ["stats", "学习统计"],
   ["insights", "考点提炼"],
-  ["resources", "备考资料"],
   ["admin", "本地管理"],
 ];
 
@@ -199,8 +205,7 @@ function saveUsers(items) {
 async function ensureAdmin() {
   const list = users();
   if (list.some((u) => u.username === "admin")) return;
-  const password = await makePassword("admin123");
-  list.push({ username: "admin", role: "super", ...password, createdAt: nowIso() });
+  list.push({ username: "admin", role: "super", ...(await makePassword("admin123")), createdAt: nowIso() });
   saveUsers(list);
 }
 
@@ -223,83 +228,74 @@ function clearError() {
   state.error = "";
 }
 
-function getUserData(username = state.user?.username) {
-  const data = readJson(STORAGE.userData(username), {});
-  data.answerLog ||= [];
-  data.records ||= {};
-  data.notes ||= {};
-  data.favorites ||= [];
-  data.createdAt ||= nowIso();
-  return data;
+function data(username = state.user?.username) {
+  const d = readJson(STORAGE.data(username), {});
+  d.answerLog ||= [];
+  d.records ||= {};
+  d.notes ||= {};
+  d.favorites ||= [];
+  d.mastery ||= {};
+  return migrateLearningData(d);
 }
 
-function saveUserData(data, username = state.user?.username) {
-  data.updatedAt = nowIso();
-  writeJson(STORAGE.userData(username), data);
+function saveData(d, username = state.user?.username) {
+  d.updatedAt = nowIso();
+  writeJson(STORAGE.data(username), d);
 }
 
-function loadQuiz(username = state.user?.username) {
-  state.quiz = readJson(STORAGE.quiz(username), null);
+function migrateLearningData(d) {
+  return d;
 }
 
-function saveQuiz() {
+function loadRound(username = state.user?.username) {
+  state.round = readJson(STORAGE.round(username), null);
+}
+
+function saveRound() {
   if (!state.user) return;
-  if (!state.quiz) localStorage.removeItem(STORAGE.quiz(state.user.username));
-  else writeJson(STORAGE.quiz(state.user.username), state.quiz);
+  if (state.round) writeJson(STORAGE.round(state.user.username), state.round);
+  else localStorage.removeItem(STORAGE.round(state.user.username));
 }
 
-function rebuildRecords(answerLog) {
+function rebuildRecords(log, mastery = {}) {
   const records = {};
-  const sorted = [...(answerLog || [])].sort((a, b) => new Date(a.at) - new Date(b.at));
+  const sorted = [...(log || [])].sort((a, b) => new Date(a.at) - new Date(b.at));
   for (const item of sorted) {
-    if (item.correct === null || item.correct === undefined) continue;
     const id = String(item.questionId);
-    const at = item.at || nowIso();
     const rec = records[id] || {
       attempts: 0,
       correctCount: 0,
       wrongCount: 0,
-      consecutiveCorrect: 0,
-      reviewStage: -1,
-      mastered: false,
-      firstAnswerAt: at,
+      firstAnswerAt: item.at,
     };
     rec.attempts += 1;
-    rec.lastAnswerAt = at;
+    rec.lastAnswerAt = item.at;
     rec.lastMode = item.mode || "";
     rec.lastSelected = item.selected || [];
     if (item.correct) {
       rec.correctCount += 1;
-      rec.consecutiveCorrect += 1;
-      rec.lastCorrectAt = at;
-      if (rec.wrongCount > 0) {
-        if (rec.consecutiveCorrect >= 3) {
-          rec.mastered = true;
-          rec.nextReviewAt = null;
-        } else {
-          rec.mastered = false;
-          rec.reviewStage = Math.min((rec.reviewStage || -1) + 1, REVIEW_INTERVALS.length - 1);
-          rec.nextReviewAt = new Date(new Date(at).getTime() + REVIEW_INTERVALS[Math.max(0, rec.reviewStage)]).toISOString();
-        }
-      }
+      rec.lastCorrectAt = item.at;
     } else {
       rec.wrongCount += 1;
-      rec.consecutiveCorrect = 0;
-      rec.reviewStage = -1;
-      rec.mastered = false;
-      rec.firstWrongAt ||= at;
-      rec.lastWrongAt = at;
-      rec.nextReviewAt = at;
+      rec.lastWrongAt = item.at;
     }
+    rec.mastered = mastery[id] === true;
     records[id] = rec;
   }
   return records;
 }
 
+function syncRecords() {
+  const d = data();
+  d.records = rebuildRecords(d.answerLog, d.mastery);
+  saveData(d);
+  return d.records;
+}
+
 function recordAttempt(questionId, selected, correct, mode, key) {
-  const data = getUserData();
-  data.answerLog = (data.answerLog || []).filter((item) => item.key !== key);
-  data.answerLog.push({
+  const d = data();
+  d.answerLog = (d.answerLog || []).filter((x) => x.key !== key);
+  d.answerLog.push({
     key,
     questionId: Number(questionId),
     selected: selected || [],
@@ -307,54 +303,250 @@ function recordAttempt(questionId, selected, correct, mode, key) {
     mode,
     at: nowIso(),
   });
-  data.records = rebuildRecords(data.answerLog);
-  saveUserData(data);
+  d.records = rebuildRecords(d.answerLog, d.mastery);
+  saveData(d);
 }
 
-function syncRecords() {
-  const data = getUserData();
-  const records = rebuildRecords(data.answerLog || []);
-  data.records = records;
-  saveUserData(data);
-  return records;
+function q(id) {
+  return QMAP.get(Number(id));
 }
 
-function questionById(id) {
-  return QUESTION_MAP.get(Number(id));
+function answerText(question) {
+  if (!question) return "";
+  if (question.questionType === "简答") return question.answerText || question.explanation || "参考答案见解析";
+  return (question.answerLetters || []).map((letter) => `${letter}. ${question.options?.[letter] || ""}`).join("；") || question.answerText;
 }
 
-function answerDisplay(q) {
-  if (!q) return "";
-  if (q.answerLetters?.length) {
-    return q.answerLetters.map((letter) => `${letter}. ${q.options?.[letter] || ""}`).join("；");
-  }
-  return q.answerText || q.explanation || "参考解析";
+function selectedText(question, selected) {
+  if (question.questionType === "简答") return selected?.[0] || "";
+  return (selected || []).map((letter) => `${letter}. ${question.options?.[letter] || ""}`).join("；");
 }
 
-function selectedText(q, selected) {
-  if (!Array.isArray(selected)) return "";
-  if (q.type === "essay") return selected[0] || "";
-  return selected.map((letter) => `${letter}. ${q.options?.[letter] || ""}`).join("；");
-}
-
-function isCorrect(q, selected) {
-  const a = [...(q.answerLetters || [])].sort().join("");
+function isCorrect(question, selected) {
+  const a = [...(question.answerLetters || [])].sort().join("");
   const b = [...(selected || [])].sort().join("");
   return Boolean(a) && a === b;
 }
 
-function selectedQuestionIds(set = state.selectedNodeIds) {
-  if (!set || set.size === 0 || set.has("root")) return BANK.map((q) => q.id);
-  const ids = new Set();
-  for (const nodeId of set) {
-    const node = NODE_MAP.get(nodeId);
-    if (node) node.questionIds.forEach((id) => ids.add(Number(id)));
-  }
-  return [...ids];
+function currentRoot() {
+  return CATEGORY_TREES[state.selectedDifficulty] || CATEGORY_TREES["全部难度"];
 }
 
-function questionInNodeSet(q, set) {
-  return selectedQuestionIds(set).includes(Number(q.id));
+function setDifficulty(layer) {
+  state.selectedDifficulty = layer;
+  state.selectedCategoryIds = new Set(["all"]);
+  state.expandedCategoryIds.add(currentRoot().id);
+  render();
+}
+
+function toggleType(type) {
+  state.selectedTypes.has(type) ? state.selectedTypes.delete(type) : state.selectedTypes.add(type);
+  if (!state.selectedTypes.size) state.selectedTypes.add(type);
+  render();
+}
+
+function selectedCategoryQuestionIds() {
+  if (state.selectedCategoryIds.has("all") || !state.selectedCategoryIds.size) return null;
+  const ids = new Set();
+  for (const id of state.selectedCategoryIds) {
+    const node = CATEGORY_NODE_MAP.get(id);
+    if (node) node.questionIds.forEach((qid) => ids.add(Number(qid)));
+  }
+  return ids;
+}
+
+function filteredQuestions(base = BANK) {
+  const catIds = selectedCategoryQuestionIds();
+  return base.filter((question) => {
+    const layerOk = state.selectedDifficulty === "全部难度" || question.difficultyLayer === state.selectedDifficulty;
+    const typeOk = state.selectedTypes.has(question.questionType);
+    const catOk = !catIds || catIds.has(question.id);
+    const favOk = !state.favoriteOnly || isFavorited(question.id);
+    return layerOk && typeOk && catOk && favOk;
+  });
+}
+
+function countLabel() {
+  const layer = state.selectedDifficulty;
+  const types = [...state.selectedTypes].join("、");
+  const categories = state.selectedCategoryIds.has("all") ? "全部分类" : `${state.selectedCategoryIds.size}个分类`;
+  return `${layer} + ${types} + ${categories}，共 ${filteredQuestions().length} 道题`;
+}
+
+function layerCounts() {
+  const counts = Object.fromEntries(SCHEMA.difficultyLayers.map((layer) => [layer, 0]));
+  for (const question of BANK) counts[question.difficultyLayer] = (counts[question.difficultyLayer] || 0) + 1;
+  return counts;
+}
+
+function favoriteItems(d = data()) {
+  return (d.favorites || [])
+    .map((item) => ({
+      questionId: Number(typeof item === "object" ? item.questionId : item),
+      createdAt: typeof item === "object" ? item.createdAt : nowIso(),
+    }))
+    .filter((item) => q(item.questionId));
+}
+
+function favoriteSet(d = data()) {
+  return new Set(favoriteItems(d).map((item) => item.questionId));
+}
+
+function isFavorited(questionId) {
+  return favoriteSet().has(Number(questionId));
+}
+
+function toggleFavorite(questionId) {
+  const d = data();
+  const items = favoriteItems(d);
+  const index = items.findIndex((item) => item.questionId === Number(questionId));
+  if (index >= 0) {
+    items.splice(index, 1);
+    showToast("已取消收藏");
+  } else {
+    items.push({ questionId: Number(questionId), createdAt: nowIso() });
+    showToast("已收藏");
+  }
+  d.favorites = items;
+  saveData(d);
+}
+
+function noteOf(questionId) {
+  return data().notes?.[String(questionId)] || null;
+}
+
+function saveNote(questionId) {
+  const input = document.getElementById(`note-editor-${questionId}`);
+  const note = (input?.value || "").trim();
+  if (note.length > 500) return showError("备注最多 500 字。");
+  const d = data();
+  if (note) d.notes[String(questionId)] = { note, updateTime: nowIso() };
+  else delete d.notes[String(questionId)];
+  state.noteEditorId = null;
+  saveData(d);
+  showToast(note ? "备注已保存" : "备注已删除");
+}
+
+function deleteNote(questionId) {
+  const d = data();
+  delete d.notes[String(questionId)];
+  state.noteEditorId = null;
+  saveData(d);
+  showToast("备注已删除");
+}
+
+function markMastered(questionId, mastered) {
+  const d = data();
+  d.mastery[String(questionId)] = Boolean(mastered);
+  d.records = rebuildRecords(d.answerLog, d.mastery);
+  saveData(d);
+  showToast(mastered ? "已标记掌握" : "已标记未掌握");
+}
+
+function stats() {
+  const d = data();
+  d.records = rebuildRecords(d.answerLog, d.mastery);
+  const records = d.records;
+  const recordItems = Object.entries(records).map(([id, rec]) => ({ id: Number(id), ...rec }));
+  const attempts = recordItems.reduce((sum, rec) => sum + rec.attempts, 0);
+  const correct = recordItems.reduce((sum, rec) => sum + rec.correctCount, 0);
+  const wrongItems = recordItems.filter((rec) => rec.wrongCount > 0);
+  return {
+    records,
+    answerLog: d.answerLog || [],
+    attempts,
+    correct,
+    accuracy: attempts ? correct / attempts : 0,
+    answered: recordItems.length,
+    wrongItems,
+    wrongCount: wrongItems.length,
+    masteredCount: Object.values(d.mastery || {}).filter(Boolean).length,
+    layerRows: statRowsByLayer(records),
+    categoryRows: statRowsByCategory(records),
+    topWrong: wrongItems.map((rec) => ({ ...q(rec.id), ...rec })).filter((x) => x.id).sort((a, b) => b.wrongCount - a.wrongCount).slice(0, 20),
+  };
+}
+
+function rowStats(ids, records) {
+  const total = ids.length;
+  const answered = ids.filter((id) => records[String(id)]?.attempts > 0).length;
+  const attempts = ids.reduce((sum, id) => sum + (records[String(id)]?.attempts || 0), 0);
+  const correct = ids.reduce((sum, id) => sum + (records[String(id)]?.correctCount || 0), 0);
+  const wrong = ids.filter((id) => (records[String(id)]?.wrongCount || 0) > 0).length;
+  const mastered = ids.filter((id) => records[String(id)]?.mastered).length;
+  return { total, answered, attempts, correct, wrong, mastered, completion: total ? answered / total : 0, accuracy: attempts ? correct / attempts : null };
+}
+
+function statRowsByLayer(records) {
+  return SCHEMA.difficultyLayers.map((layer) => {
+    const ids = BANK.filter((question) => question.difficultyLayer === layer).map((question) => question.id);
+    return { layer, name: layer, path: layer, ...rowStats(ids, records) };
+  });
+}
+
+function statRowsByCategory(records) {
+  const rows = [];
+  for (const layer of SCHEMA.difficultyLayers) {
+    function walk(node, depth = 0) {
+      if (node.path.length) rows.push({ id: node.id, layer, depth, name: node.name, path: `${layer} / ${node.path.join(" / ")}`, ...rowStats(node.questionIds, records) });
+      node.children.forEach((child) => walk(child, depth + 1));
+    }
+    walk(CATEGORY_TREES[layer]);
+  }
+  return rows;
+}
+
+function weakRows(limit = 10) {
+  return stats().categoryRows
+    .filter((row) => row.attempts >= 2)
+    .map((row) => ({ ...row, weakScore: (row.accuracy ?? 1) + row.completion * 0.1 - row.wrong * 0.005 }))
+    .sort((a, b) => a.weakScore - b.weakScore || b.wrong - a.wrong)
+    .slice(0, limit);
+}
+
+function layerUnlocked(layer) {
+  const index = SCHEMA.difficultyLayers.indexOf(layer);
+  if (index <= 0) return true;
+  const s = stats();
+  return SCHEMA.difficultyLayers.slice(0, index).every((prev) => {
+    const row = s.layerRows.find((item) => item.layer === prev);
+    return row && row.completion >= 1;
+  });
+}
+
+function poolForMode(mode = state.mode) {
+  const s = stats();
+  if (mode === "wrong") {
+    const wrongIds = new Set(s.wrongItems.map((item) => item.id));
+    return filteredQuestions().filter((question) => wrongIds.has(question.id));
+  }
+  if (mode === "weak") {
+    const weakest = weakRows(1)[0];
+    if (!weakest) return filteredQuestions();
+    const node = CATEGORY_NODE_MAP.get(weakest.id);
+    const ids = new Set(node?.questionIds || []);
+    return BANK.filter((question) => ids.has(question.id) && state.selectedTypes.has(question.questionType));
+  }
+  if (mode === "ladder") {
+    const base = BANK.filter((question) => {
+      const catIds = selectedCategoryQuestionIds();
+      return state.selectedTypes.has(question.questionType) && (!catIds || catIds.has(question.id)) && (!state.favoriteOnly || isFavorited(question.id));
+    });
+    for (const layer of SCHEMA.difficultyLayers) {
+      if (!layerUnlocked(layer)) break;
+      const layerItems = base.filter((question) => question.difficultyLayer === layer);
+      const incomplete = layerItems.filter((question) => !s.records[String(question.id)]?.attempts);
+      if (incomplete.length) return incomplete.sort((a, b) => a.categoryKey.localeCompare(b.categoryKey, "zh-CN") || a.id - b.id);
+    }
+    return base.sort((a, b) => SCHEMA.difficultyLayers.indexOf(a.difficultyLayer) - SCHEMA.difficultyLayers.indexOf(b.difficultyLayer) || a.id - b.id);
+  }
+  if (mode === "random") {
+    let pool = state.randomMixed ? BANK.filter((question) => state.selectedTypes.has(question.questionType)) : filteredQuestions();
+    if (state.excludeMastered) pool = pool.filter((question) => !s.records[String(question.id)]?.mastered);
+    if (state.favoriteOnly) pool = pool.filter((question) => isFavorited(question.id));
+    return pool;
+  }
+  return filteredQuestions();
 }
 
 function shuffle(items) {
@@ -366,202 +558,51 @@ function shuffle(items) {
   return arr;
 }
 
-function favoriteSet(data = getUserData()) {
-  return new Set((data.favorites || []).map((item) => Number(typeof item === "object" ? item.questionId : item)));
-}
-
-function isFavorited(questionId) {
-  return favoriteSet().has(Number(questionId));
-}
-
-function toggleFavorite(questionId) {
-  const data = getUserData();
-  const id = Number(questionId);
-  const items = (data.favorites || []).map((item) => ({
-    questionId: Number(typeof item === "object" ? item.questionId : item),
-    createdAt: typeof item === "object" ? item.createdAt : nowIso(),
-  })).filter((item) => questionById(item.questionId));
-  const index = items.findIndex((item) => item.questionId === id);
-  if (index >= 0) {
-    items.splice(index, 1);
-    showToast("已取消收藏");
-  } else {
-    items.push({ questionId: id, createdAt: nowIso() });
-    showToast("已收藏");
-  }
-  data.favorites = items;
-  saveUserData(data);
-}
-
-function saveNote(questionId) {
-  const input = document.getElementById(`note-editor-${questionId}`);
-  const note = (input?.value || "").trim();
-  if (note.length > 500) return showError("备注最多 500 字。");
-  const data = getUserData();
-  if (note) data.notes[String(questionId)] = { note, updateTime: nowIso() };
-  else delete data.notes[String(questionId)];
-  state.noteEditorId = null;
-  saveUserData(data);
-  showToast(note ? "备注已保存" : "备注已删除");
-}
-
-function deleteNote(questionId) {
-  const data = getUserData();
-  delete data.notes[String(questionId)];
-  state.noteEditorId = null;
-  saveUserData(data);
-  showToast("备注已删除");
-}
-
-function noteOf(questionId) {
-  return getUserData().notes?.[String(questionId)] || null;
-}
-
-function stats() {
-  const data = getUserData();
-  data.records = rebuildRecords(data.answerLog || []);
-  const records = data.records;
-  const recordList = Object.entries(records).map(([id, rec]) => ({ id: Number(id), ...rec }));
-  const attempts = recordList.reduce((sum, rec) => sum + rec.attempts, 0);
-  const correct = recordList.reduce((sum, rec) => sum + rec.correctCount, 0);
-  const wrongQuestions = recordList.filter((rec) => rec.wrongCount > 0);
-  const mastered = recordList.filter((rec) => rec.mastered).length;
-  const due = reviewQuestions(records);
-  const topWrong = wrongQuestions
-    .map((rec) => ({ ...questionById(rec.id), ...rec }))
-    .filter((q) => q.id)
-    .sort((a, b) => b.wrongCount - a.wrongCount || a.id - b.id)
-    .slice(0, 20);
-  const hierarchyStats = hierarchyRows(records);
-  return {
-    records,
-    attempts,
-    correct,
-    accuracy: attempts ? correct / attempts : 0,
-    answeredQuestions: recordList.length,
-    wrongQuestions,
-    wrongCount: wrongQuestions.length,
-    mastered,
-    due,
-    topWrong,
-    hierarchyStats,
-    answerLog: data.answerLog || [],
-  };
-}
-
-function hierarchyRows(records) {
-  const rows = [];
-  function walk(node, depth = 0) {
-    if (node.id !== "root") {
-      const ids = node.questionIds || [];
-      const answered = ids.filter((id) => records[String(id)]?.attempts > 0).length;
-      const attempts = ids.reduce((sum, id) => sum + (records[String(id)]?.attempts || 0), 0);
-      const correct = ids.reduce((sum, id) => sum + (records[String(id)]?.correctCount || 0), 0);
-      const wrong = ids.filter((id) => (records[String(id)]?.wrongCount || 0) > 0).length;
-      const mastered = ids.filter((id) => records[String(id)]?.mastered).length;
-      rows.push({
-        id: node.id,
-        depth,
-        name: node.name,
-        path: [HIERARCHY.name, ...node.path].join(" / "),
-        total: ids.length,
-        answered,
-        attempts,
-        correct,
-        wrong,
-        mastered,
-        completion: ids.length ? answered / ids.length : 0,
-        accuracy: attempts ? correct / attempts : null,
-      });
-    }
-    node.children.forEach((child) => walk(child, depth + 1));
-  }
-  walk(HIERARCHY);
-  return rows;
-}
-
-function reviewQuestions(records = stats().records) {
-  const now = Date.now();
-  return Object.entries(records)
-    .filter(([, rec]) => rec.wrongCount > 0 && !rec.mastered)
-    .map(([id, rec]) => ({ ...questionById(id), ...rec }))
-    .filter((q) => q.id)
-    .sort((a, b) => reviewPriority(a, now) - reviewPriority(b, now));
-}
-
-function reviewPriority(q, now = Date.now()) {
-  const next = q.nextReviewAt ? new Date(q.nextReviewAt).getTime() : Infinity;
-  if (q.reviewStage < 0) return 0;
-  if (next <= now) return 1 + Math.max(0, next - now) / 1000000000;
-  return 2 + Math.max(0, 1 - (q.correctCount || 0) / Math.max(1, q.attempts || 1));
-}
-
-function weakNodes(limit = 12) {
-  return stats().hierarchyStats
-    .filter((row) => row.attempts >= 2)
-    .map((row) => ({ ...row, score: (row.accuracy ?? 1) + row.completion * 0.15 }))
-    .sort((a, b) => a.score - b.score || b.wrong - a.wrong)
-    .slice(0, limit);
-}
-
-function poolForCurrentConfig() {
-  const s = stats();
-  let pool = [];
-  if (state.practiceMode === "hierarchy") {
-    const ids = selectedQuestionIds(state.selectedNodeIds);
-    pool = ids.map(questionById).filter(Boolean);
-  } else if (state.practiceMode === "ladder") {
-    const ids = selectedQuestionIds(state.selectedNodeIds);
-    pool = ids.map(questionById).filter(Boolean).sort((a, b) => a.pathKey.localeCompare(b.pathKey, "zh-CN") || a.id - b.id);
-  } else if (state.practiceMode === "weak") {
-    const weak = weakNodes(10);
-    const ids = new Set();
-    weak.forEach((row) => NODE_MAP.get(row.id)?.questionIds.forEach((id) => ids.add(Number(id))));
-    pool = [...ids].map(questionById).filter(Boolean);
-    if (!pool.length) pool = selectedQuestionIds(state.selectedNodeIds).map(questionById).filter(Boolean);
-  } else if (state.practiceMode === "random") {
-    pool = [...BANK];
-    if (state.randomSource === "unanswered") {
-      pool = pool.filter((q) => !s.records[String(q.id)]?.attempts);
-    }
-    if (state.excludeMastered) {
-      pool = pool.filter((q) => !s.records[String(q.id)]?.mastered);
-    }
-  } else if (state.practiceMode === "wrong") {
-    const ids = new Set(selectedQuestionIds(state.wrongNodeIds));
-    pool = s.wrongQuestions.map((rec) => questionById(rec.id)).filter((q) => q && ids.has(q.id));
-  }
-  if (state.favoriteOnly) {
-    const fav = favoriteSet();
-    pool = pool.filter((q) => fav.has(q.id));
-  }
-  return pool;
-}
-
 function currentCount(pool) {
   const custom = Number(state.customCount);
-  if (Number.isInteger(custom) && custom > 0) return custom;
-  return Number(state.practiceCount) || 10;
+  return Number.isInteger(custom) && custom > 0 ? custom : Number(state.count) || 10;
 }
 
-function startQuiz(mode = state.practiceMode, ids = null) {
-  state.practiceMode = mode;
-  const pool = ids ? ids.map(questionById).filter(Boolean) : poolForCurrentConfig();
+function setMode(mode) {
+  state.mode = mode;
+  clearError();
+  render();
+}
+
+function setCount(value) {
+  state.count = Number(value);
+  state.customCount = "";
+  render();
+}
+
+function confirmCustomCount() {
+  const value = Number(document.getElementById("custom-count")?.value);
+  if (!Number.isInteger(value) || value < 1) return showError("请输入 ≥ 1 的正整数题量。");
+  const total = poolForMode().length;
+  if (value > total) return showError(`当前筛选总题量为 ${total}，不可超出。`);
+  state.customCount = String(value);
+  showToast(`已设置 ${value} 题`);
+}
+
+function setAllCount() {
+  const total = poolForMode().length;
+  if (!total) return showError("当前筛选条件下没有题目。");
+  state.customCount = String(total);
+  render();
+}
+
+function startRound(mode = state.mode, explicitIds = null) {
+  state.mode = mode;
+  let pool = explicitIds ? explicitIds.map(q).filter(Boolean) : poolForMode(mode);
   if (!pool.length) return showError("当前筛选条件下没有可出题目。");
-  const count = ids ? pool.length : currentCount(pool);
+  const count = explicitIds ? pool.length : currentCount(pool);
   if (!Number.isInteger(count) || count < 1) return showError("请输入 ≥ 1 的正整数题量。");
   if (count > pool.length) return showError(`当前筛选总题量为 ${pool.length}，不可超出。`);
-  const ordered = mode === "ladder" ? pool : shuffle(pool);
-  state.quiz = {
+  if (mode !== "ladder") pool = shuffle(pool);
+  state.round = {
     id: randomId(),
     mode,
-    config: {
-      favoriteOnly: state.favoriteOnly,
-      randomSource: state.randomSource,
-      selectedNodeIds: [...state.selectedNodeIds],
-      count,
-    },
-    questionIds: ordered.slice(0, count).map((q) => q.id),
+    questionIds: pool.slice(0, count).map((question) => question.id),
     currentIndex: 0,
     answers: {},
     createdAt: nowIso(),
@@ -569,37 +610,35 @@ function startQuiz(mode = state.practiceMode, ids = null) {
   };
   state.view = "practice";
   clearError();
-  saveQuiz();
+  saveRound();
   render();
 }
 
-function endQuiz() {
-  if (!state.quiz) return;
+function endRound() {
+  if (!state.round) return;
   if (!confirm("确认结束本轮刷题？未答题目会从本轮缓存中清除。")) return;
-  state.quiz = null;
-  saveQuiz();
+  state.round = null;
+  saveRound();
   render();
 }
 
-function quizQuestion() {
-  if (!state.quiz) return null;
-  return questionById(state.quiz.questionIds[state.quiz.currentIndex]);
+function currentQuestion() {
+  return state.round ? q(state.round.questionIds[state.round.currentIndex]) : null;
 }
 
 function answerFor(questionId) {
-  if (!state.quiz) return { selected: [], submitted: false };
-  state.quiz.answers[String(questionId)] ||= { selected: [], submitted: false };
-  return state.quiz.answers[String(questionId)];
+  state.round.answers[String(questionId)] ||= { selected: [], submitted: false };
+  return state.round.answers[String(questionId)];
 }
 
 function attemptKey(questionId) {
-  return `${state.quiz.id}:${questionId}`;
+  return `${state.round.id}:${questionId}`;
 }
 
 function selectOption(questionId, letter) {
-  const q = questionById(questionId);
+  const question = q(questionId);
   const ans = answerFor(questionId);
-  if (q.type === "multiple") {
+  if (question.questionType === "多选") {
     const set = new Set(ans.selected || []);
     set.has(letter) ? set.delete(letter) : set.add(letter);
     ans.selected = [...set].sort();
@@ -607,88 +646,86 @@ function selectOption(questionId, letter) {
     ans.selected = [letter];
   }
   if (ans.submitted) ans.dirty = true;
-  state.quiz.updatedAt = nowIso();
-  saveQuiz();
+  state.round.updatedAt = nowIso();
+  saveRound();
   render();
 }
 
 function updateEssay(questionId) {
   const ans = answerFor(questionId);
-  const text = document.getElementById(`essay-${questionId}`)?.value || "";
-  ans.selected = [text];
+  ans.selected = [document.getElementById(`essay-${questionId}`)?.value || ""];
   if (ans.submitted) ans.dirty = true;
-  state.quiz.updatedAt = nowIso();
-  saveQuiz();
+  state.round.updatedAt = nowIso();
+  saveRound();
 }
 
 function submitAnswer(questionId) {
-  const q = questionById(questionId);
+  const question = q(questionId);
   const ans = answerFor(questionId);
-  if (q.type === "essay") {
+  if (question.questionType === "简答") {
     ans.submitted = true;
     ans.dirty = false;
     ans.revealedAt = nowIso();
-    state.quiz.updatedAt = nowIso();
-    saveQuiz();
+    state.round.updatedAt = nowIso();
+    saveRound();
     render();
     return;
   }
   if (!ans.selected?.length) return showError("请先选择答案。");
-  const correct = isCorrect(q, ans.selected);
+  const correct = isCorrect(question, ans.selected);
   ans.submitted = true;
   ans.dirty = false;
   ans.correct = correct;
   ans.submittedAt = nowIso();
-  recordAttempt(q.id, ans.selected, correct, state.quiz.mode, attemptKey(q.id));
-  state.quiz.updatedAt = nowIso();
-  saveQuiz();
+  recordAttempt(question.id, ans.selected, correct, state.round.mode, attemptKey(question.id));
+  state.round.updatedAt = nowIso();
+  saveRound();
   clearError();
   render();
 }
 
-function gradeEssay(questionId, correct) {
+function gradeEssay(questionId, mastered) {
   const ans = answerFor(questionId);
   ans.submitted = true;
   ans.dirty = false;
-  ans.correct = Boolean(correct);
+  ans.correct = Boolean(mastered);
   ans.submittedAt = nowIso();
-  recordAttempt(questionId, ans.selected || [], Boolean(correct), state.quiz.mode, attemptKey(questionId));
-  state.quiz.updatedAt = nowIso();
-  saveQuiz();
+  recordAttempt(questionId, ans.selected || [], Boolean(mastered), state.round.mode, attemptKey(questionId));
+  markMastered(questionId, Boolean(mastered));
+  state.round.updatedAt = nowIso();
+  saveRound();
   render();
 }
 
 function gotoQuestion(delta) {
-  if (!state.quiz) return;
-  const next = state.quiz.currentIndex + delta;
-  if (next < 0 || next >= state.quiz.questionIds.length) return;
-  state.quiz.currentIndex = next;
-  saveQuiz();
+  const next = state.round.currentIndex + delta;
+  if (next < 0 || next >= state.round.questionIds.length) return;
+  state.round.currentIndex = next;
+  saveRound();
   render();
 }
 
 function generateInsight(questionId) {
-  const q = questionById(questionId);
+  const question = q(questionId);
   const ans = answerFor(questionId);
-  const bits = [];
-  bits.push(`【考点】${q.topic || q.path.at(-1)}`);
-  if (q.tags?.length) bits.push(`【记忆标签】${q.tags.slice(0, 5).join("、")}`);
-  bits.push(`【标准答案】${answerDisplay(q)}`);
-  if (q.explanation) bits.push(`【背诵要点】${q.explanation}`);
-  else bits.push(`【背诵要点】围绕“${q.topic || q.moduleName}”理解题干关键词，优先记住标准答案对应表述。`);
-  ans.insight = bits.join("\n");
-  saveQuiz();
+  ans.insight = [
+    `【难度】${question.difficultyLayer}`,
+    `【分类】${question.categoryKey}`,
+    `【题型】${question.questionType}`,
+    `【标准答案】${answerText(question)}`,
+    `【背诵要点】${question.explanation || `围绕“${question.categoryKey}”记住题干关键词与标准答案。`}`,
+  ].join("\n");
+  saveRound();
   render();
 }
 
 function modeName(mode) {
   return {
     hierarchy: "层级专项",
-    ladder: "阶梯式",
+    ladder: "阶梯式刷题",
     weak: "薄弱层级",
     random: "全真随机",
     wrong: "错题专项",
-    review: "今日复习",
     favorite: "收藏复盘",
   }[mode] || "刷题";
 }
@@ -711,8 +748,7 @@ async function register() {
   if (!username || !password) return showError("请输入用户名和密码。");
   const list = users();
   if (list.some((u) => u.username === username)) return showError("用户名已存在。");
-  const hashed = await makePassword(password);
-  list.push({ username, role: "user", ...hashed, createdAt: nowIso() });
+  list.push({ username, role: "user", ...(await makePassword(password)), createdAt: nowIso() });
   saveUsers(list);
   state.authTab = "login";
   showToast("注册成功，请登录");
@@ -721,13 +757,13 @@ async function register() {
 async function login() {
   const username = document.getElementById("username")?.value.trim();
   const password = document.getElementById("password")?.value || "";
-  const item = users().find((u) => u.username === username);
-  if (!item) return showError("账号不存在。");
-  const hash = await sha256(`${item.salt}:${password}`);
-  if (hash !== item.hash) return showError("密码错误。");
-  state.user = { username: item.username, role: item.role || (item.username === "admin" ? "super" : "user") };
+  const user = users().find((u) => u.username === username);
+  if (!user) return showError("账号不存在。");
+  if ((await sha256(`${user.salt}:${password}`)) !== user.hash) return showError("密码错误。");
+  state.user = { username: user.username, role: user.role || (user.username === "admin" ? "super" : "user") };
   writeJson(STORAGE.session, { username, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 });
-  loadQuiz(username);
+  loadRound(username);
+  syncRecords();
   clearError();
   render();
 }
@@ -735,81 +771,455 @@ async function login() {
 function logout() {
   localStorage.removeItem(STORAGE.session);
   state.user = null;
-  state.quiz = null;
+  state.round = null;
   render();
 }
 
-function toggleExpand(id) {
-  state.expandedNodes.has(id) ? state.expandedNodes.delete(id) : state.expandedNodes.add(id);
+function toggleCategoryExpand(id) {
+  state.expandedCategoryIds.has(id) ? state.expandedCategoryIds.delete(id) : state.expandedCategoryIds.add(id);
   render();
 }
 
-function toggleNode(id, target = "selectedNodeIds") {
-  const set = state[target];
-  if (set.has(id)) set.delete(id);
-  else {
-    if (id === "root") set.clear();
-    else set.delete("root");
-    set.add(id);
+function toggleCategory(id) {
+  if (id === "all") {
+    state.selectedCategoryIds = new Set(["all"]);
+  } else {
+    state.selectedCategoryIds.delete("all");
+    state.selectedCategoryIds.has(id) ? state.selectedCategoryIds.delete(id) : state.selectedCategoryIds.add(id);
+    if (!state.selectedCategoryIds.size) state.selectedCategoryIds.add("all");
   }
-  if (!set.size) set.add("root");
   render();
 }
 
-function clearNodeSelection(target = "selectedNodeIds") {
-  state[target] = new Set(["root"]);
-  render();
+function renderCategoryTree(node = currentRoot(), depth = 0) {
+  const isRoot = depth === 0;
+  const id = isRoot ? "all" : node.id;
+  const checked = isRoot ? state.selectedCategoryIds.has("all") : state.selectedCategoryIds.has(node.id);
+  const expanded = state.expandedCategoryIds.has(node.id);
+  const hasChildren = node.children?.length;
+  return `
+    <div class="el-tree-node" style="--depth:${depth}">
+      <div class="el-tree-row">
+        <button class="tree-caret" onclick="toggleCategoryExpand('${node.id}')" ${hasChildren ? "" : "disabled"}>${hasChildren ? (expanded ? "▾" : "▸") : ""}</button>
+        <input type="checkbox" ${checked ? "checked" : ""} onchange="toggleCategory('${id}')">
+        <button class="tree-title" onclick="toggleCategory('${id}')">
+          <span>${esc(isRoot ? "全部分类" : node.name)}</span>
+          <span class="badge">${node.questionIds.length}题</span>
+        </button>
+      </div>
+      ${hasChildren && expanded ? `<div>${node.children.map((child) => renderCategoryTree(child, depth + 1)).join("")}</div>` : ""}
+    </div>
+  `;
 }
 
-function setPracticeMode(mode) {
-  state.practiceMode = mode;
-  clearError();
-  render();
+function renderFilterPanel() {
+  const counts = layerCounts();
+  return `
+    <section class="panel filter-panel">
+      <h3>筛选题库</h3>
+      <div class="filter-block">
+        <b>1. 难度层级</b>
+        <div class="difficulty-row">
+          <button class="difficulty-pill ${state.selectedDifficulty === "全部难度" ? "active" : ""}" onclick="setDifficulty('全部难度')">全部难度 <span>${BANK.length}</span></button>
+          ${SCHEMA.difficultyLayers.map((layer) => `<button class="difficulty-pill ${DIFFICULTY_COLORS[layer]} ${state.selectedDifficulty === layer ? "active" : ""}" onclick="setDifficulty('${layer}')">${layer} <span>${counts[layer] || 0}</span></button>`).join("")}
+        </div>
+      </div>
+      <div class="filter-block">
+        <b>2. 题型</b>
+        <div class="type-row">
+          ${SCHEMA.questionTypes.map((type) => `<label class="check-chip"><input type="checkbox" ${state.selectedTypes.has(type) ? "checked" : ""} onchange="toggleType('${type}')"> ${type}</label>`).join("")}
+        </div>
+      </div>
+      <div class="filter-block">
+        <b>3. 知识分类</b>
+        <div class="el-tree">${renderCategoryTree()}</div>
+      </div>
+      <div class="filter-summary">当前筛选：${esc(countLabel())}</div>
+    </section>
+  `;
 }
 
-function setCount(value) {
-  state.practiceCount = Number(value);
-  state.customCount = "";
-  render();
+function renderAuth() {
+  return `
+    <div class="auth-shell">
+      <div class="auth-card">
+        <section class="auth-copy">
+          <h1>大模型省赛刷题系统</h1>
+          <p>已重构为“基础层 / 进阶层 / 冲刺层 + 知识分类”的双层级题库体系，明确区分单选、多选、判断、简答。</p>
+          <ul>
+            <li>错题只做归档和手动掌握标记，不再包含任何自动复习排期。</li>
+            <li>默认管理员：admin / admin123。</li>
+            <li>所有个人数据保存在本机浏览器，不同账号互不干扰。</li>
+          </ul>
+        </section>
+        <section class="auth-form">
+          <div class="tabs">
+            <button class="tab ${state.authTab === "login" ? "active" : ""}" onclick="setAuthTab('login')">登录</button>
+            <button class="tab ${state.authTab === "register" ? "active" : ""}" onclick="setAuthTab('register')">注册</button>
+          </div>
+          <div class="field"><label>用户名</label><input id="username" autocomplete="username"></div>
+          <div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password"></div>
+          <button class="btn primary" onclick="${state.authTab === "login" ? "login()" : "register()"}">${state.authTab === "login" ? "登录" : "注册"}</button>
+          ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}
+        </section>
+      </div>
+    </div>
+  `;
 }
 
-function confirmCustomCount() {
-  const value = Number(document.getElementById("custom-count")?.value);
-  if (!Number.isInteger(value) || value < 1) return showError("请输入 ≥ 1 的正整数题量。");
-  const total = poolForCurrentConfig().length;
-  if (value > total) return showError(`当前筛选总题量为 ${total}，不可超出。`);
-  state.customCount = String(value);
-  showToast(`已设置 ${value} 题`);
+function pageTitle(title, subtitle = "", actions = "") {
+  return `
+    <div class="topbar">
+      <div><h2>${esc(title)}</h2>${subtitle ? `<p>${esc(subtitle)}</p>` : ""}</div>
+      <div class="toolbar">${actions}</div>
+    </div>
+    ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}
+  `;
 }
 
-function setAllCount() {
-  const total = poolForCurrentConfig().length;
-  if (!total) return showError("当前筛选条件下没有题目。");
-  state.customCount = String(total);
-  render();
+function renderLayout(content) {
+  const s = stats();
+  return `
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand"><b>省赛刷题系统</b><span>${BANK.length} 题 · 双层级题库</span></div>
+        <nav class="nav">
+          ${nav.map(([id, label]) => `<button class="${state.view === id ? "active" : ""}" onclick="setView('${id}')">${label}${id === "wrongbook" && s.wrongCount ? ` · ${s.wrongCount}` : ""}</button>`).join("")}
+        </nav>
+        <div class="user-box">
+          <div>${esc(state.user.username)} · ${state.user.role === "super" ? "超级管理员" : "普通用户"}</div>
+          <button class="btn ghost small" onclick="logout()">退出登录</button>
+        </div>
+      </aside>
+      <main class="main">${content}</main>
+      ${state.toast ? `<div class="toast">${esc(state.toast)}</div>` : ""}
+    </div>
+  `;
 }
 
-function startReview() {
-  const ids = new Set(selectedQuestionIds(state.reviewNodeIds));
-  const pool = reviewQuestions().filter((q) => ids.has(q.id));
-  startQuiz("review", pool.map((q) => q.id));
+function metric(label, value, suffix = "") {
+  return `<div class="panel metric"><span>${esc(label)}</span><strong>${value}${suffix}</strong></div>`;
 }
 
-function startWrong(questionId = null) {
-  if (questionId) return startQuiz("wrong", [questionId]);
-  state.practiceMode = "wrong";
-  startQuiz("wrong");
+function renderDashboard() {
+  const s = stats();
+  return pageTitle("首页", "难度分层进度、错题概览和薄弱分类") + `
+    <div class="grid cols-3">
+      ${metric("累计作答", s.attempts, "次")}
+      ${metric("总正确率", Math.round(s.accuracy * 100), "%")}
+      ${metric("错题本", s.wrongCount, "题")}
+    </div>
+    <div class="grid cols-2" style="margin-top:14px">
+      <section class="panel">
+        <h3>难度层级进度</h3>
+        ${renderLayerCards(s.layerRows)}
+      </section>
+      <section class="panel">
+        <h3>薄弱分类</h3>
+        ${weakRows(6).length ? weakRows(6).map((row) => `<div class="list-item"><b>${esc(row.path)}</b><br>正确率：${row.accuracy === null ? "-" : Math.round(row.accuracy * 100) + "%"} · 错题 ${row.wrong} · 完成 ${Math.round(row.completion * 100)}%</div>`).join("") : `<div class="empty">完成几题后会自动识别薄弱分类。</div>`}
+      </section>
+    </div>
+  `;
 }
 
-function startFavorite(questionId = null) {
-  if (questionId) return startQuiz("favorite", [questionId]);
-  const fav = favoriteQuestions();
-  startQuiz("favorite", fav.map((q) => q.id));
+function renderLayerCards(rows) {
+  return `<div class="layer-grid">${rows.map((row) => `
+    <div class="layer-card ${DIFFICULTY_COLORS[row.layer]}">
+      <b>${row.layer}</b>
+      <span>${row.answered}/${row.total} 已覆盖</span>
+      <div class="bar"><i style="width:${Math.round(row.completion * 100)}%"></i></div>
+      <small>正确率 ${row.accuracy === null ? "-" : Math.round(row.accuracy * 100) + "%"} · 错题 ${row.wrong}</small>
+    </div>
+  `).join("")}</div>`;
 }
 
-function favoriteQuestions() {
+function renderPractice() {
+  if (state.round) return renderRound();
+  const pool = poolForMode();
+  return pageTitle("刷题训练", "所有模式均绑定难度层级、题型和知识分类筛选") + `
+    <div class="split">
+      ${renderFilterPanel()}
+      <section class="panel">
+        <h3>刷题模式</h3>
+        <div class="mode-tabs">
+          ${["hierarchy", "ladder", "weak", "random", "wrong"].map((mode) => `<button class="chip ${state.mode === mode ? "active" : ""}" onclick="setMode('${mode}')">${modeName(mode)}</button>`).join("")}
+        </div>
+        <div class="field">
+          <label><input type="checkbox" style="width:auto" ${state.favoriteOnly ? "checked" : ""} onchange="state.favoriteOnly=this.checked;render()"> 只看收藏题目</label>
+        </div>
+        ${state.mode === "random" ? `
+          <div class="field">
+            <label>全真随机设置</label>
+            <label><input type="checkbox" style="width:auto" ${state.randomMixed ? "checked" : ""} onchange="state.randomMixed=this.checked;render()"> 跨难度层混合出题</label>
+            <label><input type="checkbox" style="width:auto" ${state.excludeMastered ? "checked" : ""} onchange="state.excludeMastered=this.checked;render()"> 排除手动标记已掌握题目</label>
+          </div>` : ""}
+        ${state.mode === "ladder" ? `<div class="hint">${renderLadderStatus()}</div>` : ""}
+        ${state.mode === "weak" ? `<div class="hint">薄弱层级按难度层 + 知识分类的正确率自动排序，没有历史数据时回退到当前筛选。</div>` : ""}
+        <div class="field">
+          <label>单次题量</label>
+          <div class="count-row">
+            ${[5, 10, 20].map((n) => `<button class="chip ${state.count === n && !state.customCount ? "active" : ""}" onclick="setCount(${n})">${n}题</button>`).join("")}
+            <input id="custom-count" type="number" min="1" step="1" placeholder="自定义题量" value="${esc(state.customCount)}" style="max-width:150px" oninput="state.customCount=this.value">
+            <button class="btn secondary" onclick="confirmCustomCount()">确定</button>
+            <button class="btn ghost" onclick="setAllCount()">全部题目</button>
+          </div>
+        </div>
+        <p class="muted">当前模式可出题：${pool.length} 题；本轮将抽取：${Math.min(currentCount(pool), pool.length || currentCount(pool))} 题。</p>
+        <button class="btn primary" onclick="startRound()">开始本轮刷题</button>
+      </section>
+    </div>
+  `;
+}
+
+function renderLadderStatus() {
+  const rows = stats().layerRows;
+  return SCHEMA.difficultyLayers.map((layer) => {
+    const row = rows.find((x) => x.layer === layer);
+    return `${layerUnlocked(layer) ? "已解锁" : "未解锁"}：${layer}（完成 ${Math.round((row?.completion || 0) * 100)}%）`;
+  }).join("；");
+}
+
+function renderRound() {
+  const question = currentQuestion();
+  if (!question) {
+    state.round = null;
+    saveRound();
+    return renderPractice();
+  }
+  const ans = answerFor(question.id);
+  const index = state.round.currentIndex;
+  const total = state.round.questionIds.length;
+  const pct = Math.round(((index + 1) / total) * 100);
+  return pageTitle(modeName(state.round.mode), `本轮 ${total} 题；切换页面、刷新、重新登录都保留进度`, `<button class="btn ghost" onclick="endRound()">结束本轮</button>`) + `
+    <div class="quiz-shell">
+      <section class="panel">
+        <div class="quiz-head"><b>第 ${index + 1} / ${total} 题</b><span class="muted">已提交 ${Object.values(state.round.answers).filter((a) => a.submitted && !a.dirty).length} 题</span></div>
+        <div class="progress"><span style="width:${pct}%"></span></div>
+      </section>
+      <article class="question-card">
+        <div class="question-meta">
+          <span class="badge ${DIFFICULTY_COLORS[question.difficultyLayer]}">${esc(question.difficultyLayer)}</span>
+          <span class="badge brand">${esc(question.questionType)}</span>
+          <span class="badge">${esc(question.categoryKey)}</span>
+          ${question.tags.slice(0, 4).map((tag) => `<span class="badge">${esc(tag)}</span>`).join("")}
+        </div>
+        <div class="stem">${esc(question.stem)}</div>
+        ${question.questionType === "简答" ? renderEssay(question, ans) : renderOptions(question, ans)}
+        ${renderResult(question, ans)}
+        <div class="inline-actions" style="margin-top:16px">
+          <button class="btn ghost" onclick="gotoQuestion(-1)" ${index === 0 ? "disabled" : ""}>上一题</button>
+          <button class="btn primary" onclick="submitAnswer(${question.id})">${ans.submitted && ans.dirty ? "重新提交" : ans.submitted && question.questionType !== "简答" ? "再次提交" : "提交答案"}</button>
+          <button class="btn secondary" onclick="gotoQuestion(1)" ${index === total - 1 ? "disabled" : ""}>下一题</button>
+          ${index === total - 1 ? `<button class="btn ghost" onclick="endRound()">完成本轮</button>` : ""}
+        </div>
+      </article>
+    </div>
+  `;
+}
+
+function renderOptions(question, ans) {
+  const type = question.questionType === "多选" ? "checkbox" : "radio";
+  return `<div class="options">${Object.entries(question.options).map(([letter, text]) => {
+    const selected = ans.selected?.includes(letter);
+    const show = ans.submitted && !ans.dirty;
+    const cls = show && question.answerLetters.includes(letter) ? "correct" : show && selected ? "wrong" : "";
+    return `<label class="option ${cls}"><input type="${type}" name="q-${question.id}" ${selected ? "checked" : ""} onchange="selectOption(${question.id},'${letter}')"><span><b>${letter}.</b> ${esc(text)}</span></label>`;
+  }).join("")}</div>`;
+}
+
+function renderEssay(question, ans) {
+  return `
+    <textarea id="essay-${question.id}" rows="6" maxlength="1200" placeholder="先写下自己的答题要点，提交后查看参考答案。" oninput="updateEssay(${question.id})">${esc(ans.selected?.[0] || "")}</textarea>
+    ${ans.submitted ? `<div class="essay-answer"><b>参考答案：</b>${esc(question.answerText || question.explanation || "参考答案见解析")}</div>
+      <div class="inline-actions" style="margin-top:10px">
+        <button class="btn secondary" onclick="gradeEssay(${question.id}, true)">已掌握</button>
+        <button class="btn ghost" onclick="gradeEssay(${question.id}, false)">未掌握</button>
+      </div>` : ""}
+  `;
+}
+
+function renderResult(question, ans) {
+  if (ans.submitted && ans.dirty) return `<div class="hint" style="margin-top:14px">答案已修改，请点击“重新提交”同步更新错题次数。</div>`;
+  if (!ans.submitted || ans.correct === undefined) return "";
+  return `
+    <div class="result-box ${ans.correct ? "success" : "danger-soft"}">
+      <b>${ans.correct ? "回答正确" : "回答错误"}</b><br>标准答案：${esc(answerText(question))}
+    </div>
+    <div class="inline-actions" style="margin-top:12px">
+      <button class="btn secondary" onclick="generateInsight(${question.id})">提炼本题考点</button>
+      <button class="btn ghost" onclick="toggleFavorite(${question.id})">${isFavorited(question.id) ? "★ 已收藏" : "☆ 收藏本题"}</button>
+      <button class="btn ghost" onclick="state.noteEditorId=${question.id};render()">${noteOf(question.id) ? "编辑备注" : "添加备注"}</button>
+      <button class="btn ghost" onclick="markMastered(${question.id}, ${!stats().records[String(question.id)]?.mastered})">${stats().records[String(question.id)]?.mastered ? "标记未掌握" : "标记已掌握"}</button>
+    </div>
+    ${ans.insight ? `<div class="insight-box"><b>考点提炼</b><br>${esc(ans.insight).replaceAll("\n", "<br>")}</div>` : ""}
+    ${renderNote(question.id)}
+  `;
+}
+
+function renderNote(questionId) {
+  const note = noteOf(questionId);
+  if (state.noteEditorId === Number(questionId)) {
+    return `<div class="note-box"><b>我的备注</b><textarea id="note-editor-${questionId}" rows="5" maxlength="500">${esc(note?.note || "")}</textarea><div class="inline-actions"><button class="btn primary small" onclick="saveNote(${questionId})">保存</button><button class="btn ghost small" onclick="state.noteEditorId=null;render()">取消</button><button class="btn danger small" onclick="deleteNote(${questionId})">清空删除</button></div></div>`;
+  }
+  return note ? `<div class="note-box"><b>我的备注</b><br>${esc(note.note).replaceAll("\n", "<br>")}<br><span class="muted">更新于 ${fmtTime(note.updateTime)}</span></div>` : "";
+}
+
+function renderWrongbook() {
+  const wrongIds = new Set(stats().wrongItems.map((x) => x.id));
+  const items = filteredQuestions().filter((question) => wrongIds.has(question.id)).map((question) => ({ ...question, ...stats().records[String(question.id)] }));
+  return pageTitle("错题本", "仅保留错题归档、手动掌握标记、筛选和导出，无自动复习提醒", `<button class="btn ghost" onclick="exportWrongbook()">导出 Word</button><button class="btn ghost" onclick="window.print()">打印/PDF</button>`) + `
+    <div class="split">
+      ${renderFilterPanel()}
+      <section class="panel">
+        <h3>错题列表（${items.length}）</h3>
+        ${items.length ? renderQuestionList(items, "wrong") : `<div class="empty">当前筛选下没有错题。</div>`}
+      </section>
+    </div>
+  `;
+}
+
+function renderQuestionList(items, source = "wrong") {
+  return `<div class="list">${items.map((question) => {
+    const rec = stats().records[String(question.id)] || {};
+    return `<div class="list-item">
+      <div class="question-meta">
+        <span class="badge ${DIFFICULTY_COLORS[question.difficultyLayer]}">${esc(question.difficultyLayer)}</span>
+        <span class="badge brand">${esc(question.questionType)}</span>
+        <span class="badge">${esc(question.categoryKey)}</span>
+        ${rec.wrongCount ? `<span class="badge bad">错 ${rec.wrongCount} 次</span>` : ""}
+        ${rec.mastered ? `<span class="badge good">已掌握</span>` : ""}
+      </div>
+      <b>${esc(compact(question.stem, 120))}</b>
+      ${noteOf(question.id) ? `<div class="note-box">${esc(noteOf(question.id).note)}</div>` : ""}
+      <div class="inline-actions" style="margin-top:10px">
+        <button class="btn secondary small" onclick="startRound('${source === "favorite" ? "favorite" : "wrong"}',[${question.id}])">刷这题</button>
+        <button class="btn ghost small" onclick="toggleFavorite(${question.id})">${isFavorited(question.id) ? "★ 已收藏" : "☆ 收藏"}</button>
+        <button class="btn ghost small" onclick="markMastered(${question.id}, ${!rec.mastered})">${rec.mastered ? "标记未掌握" : "标记已掌握"}</button>
+        <button class="btn ghost small" onclick="state.noteEditorId=${question.id};render()">备注</button>
+      </div>
+      ${state.noteEditorId === question.id ? renderNote(question.id) : ""}
+    </div>`;
+  }).join("")}</div>`;
+}
+
+function renderFavorites() {
   const fav = favoriteSet();
-  return BANK.filter((q) => fav.has(q.id)).sort((a, b) => a.pathKey.localeCompare(b.pathKey, "zh-CN") || a.id - b.id);
+  const items = BANK.filter((question) => fav.has(question.id)).sort((a, b) => a.difficultyLayer.localeCompare(b.difficultyLayer, "zh-CN") || a.categoryKey.localeCompare(b.categoryKey, "zh-CN"));
+  return pageTitle("我的收藏", "收藏与备注互不覆盖，可集中复盘重点题", `<button class="btn primary" onclick="startRound('favorite',[...favoriteSet()])">刷收藏题</button><button class="btn danger" onclick="clearFavorites()">批量取消收藏</button>`) + (items.length ? renderGroupedQuestions(items) : `<div class="empty">还没有收藏题目。</div>`);
+}
+
+function renderGroupedQuestions(items) {
+  const map = new Map();
+  for (const item of items) {
+    const key = `${item.difficultyLayer} / ${item.categoryPath[0] || "未分分类"}`;
+    map.set(key, map.get(key) || []);
+    map.get(key).push(item);
+  }
+  return `<div class="grid">${[...map.entries()].map(([key, qs]) => `<section class="panel"><h3>${esc(key)} <span class="badge">${qs.length}题</span></h3>${renderQuestionList(qs, "favorite")}</section>`).join("")}</div>`;
+}
+
+function clearFavorites() {
+  if (!confirm("确认取消全部收藏？备注不会删除。")) return;
+  const d = data();
+  d.favorites = [];
+  saveData(d);
+  render();
+}
+
+function renderStats() {
+  const s = stats();
+  return pageTitle("学习统计", "全局统计、难度层热力图、知识分类穿透和高频错题") + `
+    <div class="grid cols-3">
+      ${metric("已覆盖题目", s.answered, `/${BANK.length}`)}
+      ${metric("手动已掌握", s.masteredCount, "题")}
+      ${metric("错题数量", s.wrongCount, "题")}
+    </div>
+    <div class="grid cols-2" style="margin-top:14px">
+      <section class="panel"><h3>难度层热力图</h3>${renderLayerCards(s.layerRows)}</section>
+      <section class="panel"><h3>高频错题 TOP20</h3>${s.topWrong.length ? topWrongTable(s.topWrong) : `<div class="empty">暂无错题。</div>`}</section>
+    </div>
+    <section class="panel" style="margin-top:14px"><h3>知识分类穿透统计</h3>${statsTable(s.categoryRows)}</section>
+  `;
+}
+
+function statsTable(rows) {
+  return `<div class="table-wrap"><table><thead><tr><th>层级/分类</th><th>题量</th><th>完成率</th><th>正确率</th><th>错题</th><th>掌握</th></tr></thead><tbody>${rows.map((row) => `<tr><td style="padding-left:${10 + row.depth * 12}px"><b>${esc(row.name)}</b><br><span class="muted">${esc(row.path)}</span></td><td>${row.total}</td><td><div class="bar"><i style="width:${Math.round(row.completion * 100)}%"></i></div>${Math.round(row.completion * 100)}%</td><td>${row.accuracy === null ? "-" : Math.round(row.accuracy * 100) + "%"}</td><td>${row.wrong}</td><td>${row.mastered}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function topWrongTable(items) {
+  return `<table><thead><tr><th>题目</th><th>错次</th><th>操作</th></tr></thead><tbody>${items.map((question) => `<tr><td><span class="badge">${esc(question.difficultyLayer)}</span> <span class="badge">${esc(question.questionType)}</span><br>${esc(compact(question.stem, 90))}</td><td>${question.wrongCount}</td><td><button class="btn small secondary" onclick="startRound('wrong',[${question.id}])">再刷</button></td></tr>`).join("")}</tbody></table>`;
+}
+
+function renderInsights() {
+  const md = batchInsightMarkdown();
+  return pageTitle("考点提炼", "按当前筛选或错题本生成分层级背诵提纲", `<button class="btn ghost" onclick="downloadText('分层级背诵提纲.md', batchInsightMarkdown(), 'text/markdown;charset=utf-8')">导出 Markdown</button>`) + `
+    <div class="split">
+      <section class="panel">
+        <h3>提炼范围</h3>
+        <label><input type="radio" style="width:auto" name="scope" ${state.insightScope === "filtered" ? "checked" : ""} onchange="state.insightScope='filtered';render()"> 当前筛选题目</label><br>
+        <label><input type="radio" style="width:auto" name="scope" ${state.insightScope === "wrong" ? "checked" : ""} onchange="state.insightScope='wrong';render()"> 只汇总错题</label>
+        <div style="margin-top:12px">${renderFilterPanel()}</div>
+      </section>
+      <section class="panel"><h3>预览</h3><textarea rows="24" readonly>${esc(md)}</textarea></section>
+    </div>
+  `;
+}
+
+function batchInsightMarkdown() {
+  const wrong = new Set(stats().wrongItems.map((item) => item.id));
+  const items = state.insightScope === "wrong" ? BANK.filter((question) => wrong.has(question.id)) : filteredQuestions();
+  const map = new Map();
+  for (const question of items) {
+    const key = `${question.difficultyLayer} / ${question.categoryKey}`;
+    map.set(key, map.get(key) || []);
+    map.get(key).push(question);
+  }
+  let md = "# 分层级背诵提纲\n\n";
+  for (const [key, qs] of map.entries()) {
+    md += `## ${key}\n\n`;
+    for (const question of qs.slice(0, 100)) {
+      md += `- ${question.questionType}：${compact(question.stem, 90)}\n`;
+      md += `  - 答案：${answerText(question)}\n`;
+      if (question.explanation) md += `  - 要点：${question.explanation}\n`;
+    }
+    md += "\n";
+  }
+  return md;
+}
+
+function renderAdmin() {
+  if (state.user.role !== "super") return pageTitle("本地管理", "普通用户无题库管理权限") + `<div class="empty">只有管理员可以查看本页。</div>`;
+  return pageTitle("本地管理", "Excel 模板导入导出、题库备份、用户列表") + `
+    <div class="grid cols-2">
+      <section class="panel">
+        <h3>Excel 批量导入导出</h3>
+        <p class="muted">仅识别模板字段：难度层级、知识分类、题型、题干、选项A-D、标准答案、解析。其他 sheet 会被忽略。</p>
+        <div class="inline-actions">
+          <a class="btn secondary" href="./题库导入模板.xlsx" download>下载导入模板</a>
+          <label class="btn ghost">增量导入 Excel<input type="file" accept=".xlsx,.xls" style="display:none" onchange="importExcelBank(this)"></label>
+          <button class="btn ghost" onclick="exportFilteredExcel()">导出当前筛选 Excel</button>
+          <button class="btn ghost" onclick="exportAllExcel()">导出全库 Excel</button>
+        </div>
+        ${!window.XLSX ? `<div class="hint">Excel 导入导出需要在线加载 XLSX 解析器；若网络不可用，可运行本地 generate_data.py 生成 data.js。</div>` : ""}
+      </section>
+      <section class="panel">
+        <h3>数据备份</h3>
+        <div class="inline-actions">
+          <button class="btn secondary" onclick="exportBackup()">备份本地学习数据</button>
+          <label class="btn ghost">恢复备份<input type="file" accept=".json" style="display:none" onchange="importBackup(this)"></label>
+          <button class="btn danger" onclick="clearBankOverride()">恢复内置题库</button>
+        </div>
+      </section>
+      <section class="panel">
+        <h3>用户列表</h3>
+        <table><thead><tr><th>用户名</th><th>角色</th><th>创建时间</th></tr></thead><tbody>${users().map((u) => `<tr><td>${esc(u.username)}</td><td>${esc(u.role || "user")}</td><td>${fmtTime(u.createdAt)}</td></tr>`).join("")}</tbody></table>
+      </section>
+      <section class="panel">
+        <h3>当前题库结构</h3>
+        ${renderFilterPanel()}
+      </section>
+    </div>
+  `;
 }
 
 function downloadText(filename, content, type = "text/plain;charset=utf-8") {
@@ -823,40 +1233,136 @@ function downloadText(filename, content, type = "text/plain;charset=utf-8") {
 }
 
 function exportWrongbook() {
-  const items = stats().wrongQuestions.map((rec) => ({ ...questionById(rec.id), ...rec })).filter((q) => q.id);
-  const rows = items.map((q) => `
-    <tr><td>${esc(q.pathKey)}</td><td>${esc(q.stem)}</td><td>${esc(answerDisplay(q))}</td><td>${q.wrongCount}</td><td>${formatTime(q.nextReviewAt)}</td><td>${esc(noteOf(q.id)?.note || "")}</td></tr>
-  `).join("");
-  const html = `<html><head><meta charset="utf-8"><title>错题本</title></head><body><h1>个人错题本</h1><table border="1" cellspacing="0" cellpadding="6"><thead><tr><th>层级</th><th>题干</th><th>答案</th><th>错次</th><th>下次复习</th><th>备注</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+  const rows = stats().wrongItems.map((rec) => ({ ...q(rec.id), ...rec }));
+  const htmlRows = rows.map((question) => `<tr><td>${esc(question.difficultyLayer)}</td><td>${esc(question.categoryKey)}</td><td>${esc(question.questionType)}</td><td>${esc(question.stem)}</td><td>${esc(answerText(question))}</td><td>${question.wrongCount}</td><td>${question.mastered ? "已掌握" : "未掌握"}</td><td>${esc(noteOf(question.id)?.note || "")}</td></tr>`).join("");
+  const html = `<html><head><meta charset="utf-8"><title>错题本</title></head><body><h1>个人错题本</h1><table border="1" cellspacing="0" cellpadding="6"><thead><tr><th>难度</th><th>知识分类</th><th>题型</th><th>题干</th><th>答案</th><th>错次</th><th>掌握状态</th><th>备注</th></tr></thead><tbody>${htmlRows}</tbody></table></body></html>`;
   downloadText("个人错题本.doc", html, "application/msword;charset=utf-8");
 }
 
-function exportInsightMarkdown() {
-  const md = batchInsightMarkdown();
-  downloadText("分层级背诵提纲.md", md, "text/markdown;charset=utf-8");
+function rowsForExcel(items) {
+  return items.map((question) => ({
+    难度层级: question.difficultyLayer,
+    知识分类: question.categoryPath.join("/"),
+    题型: question.questionType,
+    题干: question.stem,
+    选项A: question.options.A || "",
+    选项B: question.options.B || "",
+    选项C: question.options.C || "",
+    选项D: question.options.D || "",
+    选项E: question.options.E || "",
+    选项F: question.options.F || "",
+    标准答案: question.questionType === "简答" ? question.answerText : question.answerLetters.join(""),
+    解析: question.explanation || "",
+    知识点标签: question.tags.join("、"),
+    "来源/依据": question.source || "",
+  }));
 }
 
-function batchInsightMarkdown() {
-  const selected = selectedQuestionIds(state.selectedNodeIds);
-  const s = stats();
-  const wrongIds = new Set(s.wrongQuestions.map((rec) => rec.id));
-  const ids = state.insightScope === "wrong" ? [...wrongIds] : selected;
-  const grouped = new Map();
-  ids.map(questionById).filter(Boolean).forEach((q) => {
-    const key = q.pathKey;
-    grouped.set(key, grouped.get(key) || []);
-    grouped.get(key).push(q);
-  });
-  let md = "# 分层级背诵提纲\n\n";
-  for (const [path, qs] of grouped.entries()) {
-    md += `## ${path}\n\n`;
-    qs.slice(0, 80).forEach((q) => {
-      md += `- ${q.topic || "考点"}：${answerDisplay(q)}\n`;
-      if (q.explanation) md += `  - 要点：${q.explanation}\n`;
-    });
-    md += "\n";
+function exportExcel(filename, items) {
+  const rows = rowsForExcel(items);
+  if (window.XLSX) {
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "题目");
+    XLSX.writeFile(wb, filename);
+  } else {
+    const csv = Object.keys(rows[0] || {}).join(",") + "\n" + rows.map((row) => Object.values(row).map((v) => `"${String(v).replaceAll('"', '""')}"`).join(",")).join("\n");
+    downloadText(filename.replace(/\.xlsx$/i, ".csv"), csv, "text/csv;charset=utf-8");
   }
-  return md;
+}
+
+function exportFilteredExcel() {
+  exportExcel("当前筛选题库.xlsx", filteredQuestions());
+}
+
+function exportAllExcel() {
+  exportExcel("全库题库.xlsx", BANK);
+}
+
+function validateImportedRow(row, index) {
+  const errors = [];
+  const layer = String(row.难度层级 || "").trim();
+  const type = String(row.题型 || "").trim();
+  if (!SCHEMA.difficultyLayers.includes(layer)) errors.push(`第${index}行难度层级填写错误`);
+  if (!String(row.知识分类 || "").trim()) errors.push(`第${index}行知识分类不能为空`);
+  if (!SCHEMA.questionTypes.includes(type)) errors.push(`第${index}行题型填写错误`);
+  if (!String(row.题干 || "").trim()) errors.push(`第${index}行题干不能为空`);
+  if (["单选", "多选"].includes(type)) {
+    for (const letter of "ABCD") if (!String(row[`选项${letter}`] || "").trim()) errors.push(`第${index}行选项${letter}不能为空`);
+    if (!/^[A-F]+$/i.test(String(row.标准答案 || "").trim())) errors.push(`第${index}行标准答案应填写选项字母`);
+  }
+  if (type === "判断" && !/^(对|错|正确|错误|A|B)$/i.test(String(row.标准答案 || "").trim())) errors.push(`第${index}行判断题标准答案应填写对/错`);
+  if (type === "简答" && !String(row.标准答案 || "").trim()) errors.push(`第${index}行简答题标准答案不能为空`);
+  return errors;
+}
+
+function normalizeImportedRow(row, id) {
+  const type = String(row.题型).trim();
+  const answer = String(row.标准答案 || "").trim();
+  const letters = type === "简答" ? [] : type === "判断" ? (/^(对|正确|A)$/i.test(answer) ? ["A"] : ["B"]) : [...new Set((answer.toUpperCase().match(/[A-F]/g) || []))];
+  const options = type === "判断" ? { A: "对", B: "错" } : {};
+  for (const letter of "ABCDEF") {
+    const text = String(row[`选项${letter}`] || "").trim();
+    if (text) options[letter] = text;
+  }
+  const categoryPath = String(row.知识分类 || "").split(/[\/／>＞\\|]+/).map((x) => x.trim()).filter(Boolean);
+  return {
+    id,
+    sourceId: `IMP${id}`,
+    difficultyLayer: String(row.难度层级).trim(),
+    categoryPath,
+    categoryKey: categoryPath.join(" / "),
+    questionType: type,
+    stem: String(row.题干).trim(),
+    options,
+    answerLetters: letters,
+    answerText: answer,
+    explanation: String(row.解析 || "").trim(),
+    tags: String(row.知识点标签 || "").split(/[、,，;/；|]+/).map((x) => x.trim()).filter(Boolean),
+    source: String(row["来源/依据"] || "").trim(),
+    autoScore: type !== "简答",
+  };
+}
+
+function importExcelBank(input) {
+  const file = input.files?.[0];
+  if (!file) return;
+  if (!window.XLSX) return showError("XLSX 解析器未加载，无法在浏览器内导入 Excel。可改用 generate_data.py。");
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const wb = XLSX.read(reader.result, { type: "array" });
+      const required = ["难度层级", "知识分类", "题型", "题干", "标准答案"];
+      let rows = null;
+      for (const name of wb.SheetNames) {
+        const sheetRows = XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: "" });
+        const headers = sheetRows[0] ? Object.keys(sheetRows[0]) : [];
+        if (required.every((h) => headers.includes(h))) {
+          rows = sheetRows;
+          break;
+        }
+      }
+      if (!rows) throw new Error("未找到符合模板字段的题目表");
+      const errors = rows.flatMap((row, i) => validateImportedRow(row, i + 2));
+      if (errors.length) throw new Error(errors.slice(0, 20).join("\n"));
+      const stems = new Set(BANK.map((question) => question.stem));
+      const imported = [];
+      let nextId = Math.max(...BANK.map((question) => question.id)) + 1;
+      for (const row of rows) {
+        const stem = String(row.题干 || "").trim();
+        if (!stem || stems.has(stem)) continue;
+        imported.push(normalizeImportedRow(row, nextId++));
+        stems.add(stem);
+      }
+      const merged = [...BANK, ...imported];
+      writeJson(STORAGE.bankOverride, { questions: merged, importedAt: nowIso() });
+      alert(`导入完成：新增 ${imported.length} 题，重复题干已自动跳过。页面将刷新。`);
+      location.reload();
+    } catch (err) {
+      showError(err.message || "导入失败。");
+    }
+  };
+  reader.readAsArrayBuffer(file);
 }
 
 function exportBackup() {
@@ -887,517 +1393,10 @@ function importBackup(input) {
   reader.readAsText(file, "utf-8");
 }
 
-function exportBankJson() {
-  downloadText("llm_question_bank.json", JSON.stringify({ meta: BASE_META, questions: BANK }, null, 2), "application/json;charset=utf-8");
-}
-
-function importBank(input) {
-  const file = input.files?.[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    try {
-      const payload = JSON.parse(reader.result);
-      const questions = Array.isArray(payload) ? payload : payload.questions;
-      if (!Array.isArray(questions) || !questions.length) throw new Error("empty");
-      writeJson(STORAGE.bankOverride, { questions, importedAt: nowIso() });
-      alert("本机题库覆盖已导入，页面将刷新。");
-      location.reload();
-    } catch {
-      showError("题库 JSON 格式不正确。");
-    }
-  };
-  reader.readAsText(file, "utf-8");
-}
-
 function clearBankOverride() {
+  if (!confirm("确认恢复内置题库？本机导入题库覆盖会被清除，个人学习数据不受影响。")) return;
   localStorage.removeItem(STORAGE.bankOverride);
   location.reload();
-}
-
-function renderTree(node = HIERARCHY, target = "selectedNodeIds", depth = 0) {
-  const set = state[target];
-  const checked = set.has(node.id);
-  const expanded = state.expandedNodes.has(node.id);
-  const hasChildren = node.children?.length;
-  const children = hasChildren && expanded ? node.children.map((child) => renderTree(child, target, depth + 1)).join("") : "";
-  return `
-    <div class="tree-node" style="margin-left:${depth ? 14 : 0}px">
-      <div class="tree-line">
-        <button class="twisty" onclick="toggleExpand('${node.id}')" ${hasChildren ? "" : "disabled"}>${hasChildren ? (expanded ? "−" : "+") : ""}</button>
-        <input type="checkbox" ${checked ? "checked" : ""} onchange="toggleNode('${node.id}','${target}')">
-        <label class="tree-label" onclick="toggleNode('${node.id}','${target}')">
-          <span>${esc(node.name)}</span>
-          <span class="badge">${node.questionIds?.length || 0}题</span>
-        </label>
-      </div>
-      ${children}
-    </div>
-  `;
-}
-
-function renderAuth() {
-  return `
-    <div class="auth-shell">
-      <div class="auth-card">
-        <section class="auth-copy">
-          <h1>大模型省赛层级化刷题系统</h1>
-          <p>570 题结构化导入，支持无限级层级选题、错题即时复习、艾宾浩斯排期、备注收藏和分层级背诵提纲。</p>
-          <ul>
-            <li>多账号本地数据隔离，7 天免登录。</li>
-            <li>默认管理员：admin / admin123。</li>
-            <li>静态网页，可直接部署 GitHub Pages。</li>
-          </ul>
-        </section>
-        <section class="auth-form">
-          <div class="tabs">
-            <button class="tab ${state.authTab === "login" ? "active" : ""}" onclick="setAuthTab('login')">登录</button>
-            <button class="tab ${state.authTab === "register" ? "active" : ""}" onclick="setAuthTab('register')">注册</button>
-          </div>
-          <div class="field"><label>用户名</label><input id="username" autocomplete="username"></div>
-          <div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password"></div>
-          <button class="btn primary" onclick="${state.authTab === "login" ? "login()" : "register()"}">${state.authTab === "login" ? "登录" : "注册"}</button>
-          ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}
-        </section>
-      </div>
-    </div>
-  `;
-}
-
-function renderLayout(content) {
-  const s = stats();
-  return `
-    <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <b>层级化刷题系统</b>
-          <span>${BANK.length} 题 · ${Object.keys(BASE_META.typeCounts || {}).length || 5} 类题型</span>
-        </div>
-        <nav class="nav">
-          ${nav.map(([id, label]) => `
-            <button class="${state.view === id ? "active" : ""}" onclick="setView('${id}')">${label}${id === "review" && s.due.length ? ` · ${s.due.length}` : ""}</button>
-          `).join("")}
-        </nav>
-        <div class="user-box">
-          <div>${esc(state.user.username)} · ${state.user.role === "super" ? "超级管理员" : "普通用户"}</div>
-          <button class="btn ghost small" onclick="logout()">退出登录</button>
-        </div>
-      </aside>
-      <main class="main">
-        ${content}
-      </main>
-      ${state.toast ? `<div class="toast">${esc(state.toast)}</div>` : ""}
-    </div>
-  `;
-}
-
-function pageTitle(title, subtitle = "", actions = "") {
-  return `
-    <div class="topbar">
-      <div><h2>${esc(title)}</h2>${subtitle ? `<p>${esc(subtitle)}</p>` : ""}</div>
-      <div class="toolbar">${actions}</div>
-    </div>
-    ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}
-  `;
-}
-
-function metric(label, value, suffix = "") {
-  return `<div class="panel metric"><span>${esc(label)}</span><strong>${value}${suffix}</strong></div>`;
-}
-
-function renderDashboard() {
-  const s = stats();
-  const weak = weakNodes(6);
-  return pageTitle("首页", "今日任务、薄弱层级和学习概览") + `
-    <div class="grid cols-3">
-      ${metric("今日可复习", s.due.length, "题")}
-      ${metric("累计作答", s.attempts, "次")}
-      ${metric("总正确率", Math.round(s.accuracy * 100), "%")}
-    </div>
-    <div class="grid cols-2" style="margin-top:14px">
-      <section class="panel">
-        <h3>今日待学习</h3>
-        <p class="muted">错题会立即进入今日复习，后续按 6小时→1天→3天→7天→15天自动排期。</p>
-        <div class="inline-actions">
-          <button class="btn primary" onclick="setView('review')">进入今日复习</button>
-          <button class="btn secondary" onclick="setView('practice')">开始刷题训练</button>
-        </div>
-      </section>
-      <section class="panel">
-        <h3>薄弱层级</h3>
-        ${weak.length ? weak.map((row) => `<div class="list-item"><b>${esc(row.name)}</b><br><span class="muted">${esc(row.path)}</span><br>正确率：${row.accuracy === null ? "-" : Math.round(row.accuracy * 100) + "%"} · 错题 ${row.wrong} 题</div>`).join("") : `<div class="empty">先完成几题，系统就会识别薄弱层级。</div>`}
-      </section>
-    </div>
-    <section class="panel" style="margin-top:14px">
-      <h3>层级进度</h3>
-      ${renderHierarchyStatsTable(s.hierarchyStats.slice(0, 18))}
-    </section>
-  `;
-}
-
-function renderPractice() {
-  if (state.quiz) return renderQuiz();
-  const pool = poolForCurrentConfig();
-  const unansweredCount = BANK.filter((q) => !stats().records[String(q.id)]?.attempts).length;
-  return pageTitle("刷题训练", "支持层级专项、阶梯式、薄弱层级、全真随机、错题专项") + `
-    <div class="split">
-      <section class="panel">
-        <h3>层级筛选</h3>
-        <div class="toolbar" style="margin-bottom:10px"><button class="btn small ghost" onclick="clearNodeSelection('selectedNodeIds')">全库</button></div>
-        <div class="tree">${renderTree(HIERARCHY, "selectedNodeIds")}</div>
-      </section>
-      <section class="panel">
-        <h3>刷题模式</h3>
-        <div class="mode-tabs">
-          ${["hierarchy", "ladder", "weak", "random", "wrong"].map((mode) => `<button class="chip ${state.practiceMode === mode ? "active" : ""}" onclick="setPracticeMode('${mode}')">${modeName(mode)}</button>`).join("")}
-        </div>
-        <div class="field">
-          <label><input type="checkbox" style="width:auto" ${state.favoriteOnly ? "checked" : ""} onchange="state.favoriteOnly=this.checked;render()"> 只看收藏题目</label>
-        </div>
-        ${state.practiceMode === "random" ? `
-          <div class="field">
-            <label>随机数据源</label>
-            <div class="filter-row">
-              <label><input type="radio" style="width:auto" name="randomSource" ${state.randomSource === "all" ? "checked" : ""} onchange="state.randomSource='all';render()"> 全部题目随机</label>
-              <label title="${unansweredCount ? "" : "暂无未作答习题，可切换全库随机模式"}"><input type="radio" style="width:auto" name="randomSource" ${state.randomSource === "unanswered" ? "checked" : ""} ${unansweredCount ? "" : "disabled"} onchange="state.randomSource='unanswered';render()"> 未作答题目随机（${unansweredCount}）</label>
-              <label><input type="checkbox" style="width:auto" ${state.excludeMastered ? "checked" : ""} onchange="state.excludeMastered=this.checked;render()"> 排除已掌握</label>
-            </div>
-          </div>` : ""}
-        ${state.practiceMode === "wrong" ? `<div class="hint">错题专项会读取当前账号错题本，可叠加左侧层级筛选。</div>` : ""}
-        ${state.practiceMode === "weak" ? `<div class="hint">薄弱层级按低正确率和错题数自动排序；没有历史数据时会回退到所选层级。</div>` : ""}
-        <div class="field">
-          <label>单次题量</label>
-          <div class="count-row">
-            ${[5, 10, 20].map((n) => `<button class="chip ${state.practiceCount === n && !state.customCount ? "active" : ""}" onclick="setCount(${n})">${n}题</button>`).join("")}
-            <input id="custom-count" type="number" min="1" step="1" placeholder="自定义题量" value="${esc(state.customCount)}" style="max-width:150px" oninput="state.customCount=this.value">
-            <button class="btn secondary" onclick="confirmCustomCount()">确定</button>
-            <button class="btn ghost" onclick="setAllCount()">全部题目</button>
-          </div>
-        </div>
-        <p class="muted">当前筛选可出题：${pool.length} 题；本轮将抽取：${Math.min(currentCount(pool), pool.length || currentCount(pool))} 题。</p>
-        <div class="inline-actions">
-          <button class="btn primary" onclick="startQuiz()">开始本轮刷题</button>
-        </div>
-      </section>
-    </div>
-  `;
-}
-
-function renderQuiz() {
-  const q = quizQuestion();
-  if (!q) {
-    state.quiz = null;
-    saveQuiz();
-    return renderPractice();
-  }
-  const ans = answerFor(q.id);
-  const total = state.quiz.questionIds.length;
-  const index = state.quiz.currentIndex;
-  const pct = Math.round(((index + 1) / total) * 100);
-  return pageTitle(modeName(state.quiz.mode), `本轮 ${total} 题，切换页面或刷新后会保留进度`, `<button class="btn ghost" onclick="endQuiz()">结束本轮</button>`) + `
-    <div class="quiz-shell">
-      <div class="panel">
-        <div class="quiz-head">
-          <b>第 ${index + 1} / ${total} 题</b>
-          <span class="muted">已提交 ${Object.values(state.quiz.answers).filter((a) => a.submitted && !a.dirty).length} 题</span>
-        </div>
-        <div class="progress" style="margin-top:10px"><span style="width:${pct}%"></span></div>
-      </div>
-      <article class="question-card">
-        <div class="question-meta">
-          <span class="badge brand">${esc(q.typeLabel)}</span>
-          <span class="badge">${esc(q.difficulty)}</span>
-          <span class="badge">${esc(q.pathKey)}</span>
-          ${q.tags?.slice(0, 4).map((tag) => `<span class="badge">${esc(tag)}</span>`).join("")}
-        </div>
-        <div class="stem">${esc(q.stem)}</div>
-        ${q.type === "essay" ? renderEssay(q, ans) : renderOptions(q, ans)}
-        ${renderResult(q, ans)}
-        <div class="inline-actions" style="margin-top:16px">
-          <button class="btn ghost" onclick="gotoQuestion(-1)" ${index === 0 ? "disabled" : ""}>上一题</button>
-          <button class="btn primary" onclick="submitAnswer(${q.id})">${ans.submitted && ans.dirty ? "重新提交" : ans.submitted && q.type !== "essay" ? "再次提交" : "提交答案"}</button>
-          <button class="btn secondary" onclick="gotoQuestion(1)" ${index === total - 1 ? "disabled" : ""}>下一题</button>
-          ${index === total - 1 ? `<button class="btn ghost" onclick="endQuiz()">完成本轮</button>` : ""}
-        </div>
-      </article>
-    </div>
-  `;
-}
-
-function renderOptions(q, ans) {
-  return `<div class="options">${Object.entries(q.options).map(([letter, text]) => {
-    const selected = ans.selected?.includes(letter);
-    const show = ans.submitted && !ans.dirty;
-    const correct = q.answerLetters.includes(letter);
-    const cls = show && correct ? "correct" : show && selected && !correct ? "wrong" : "";
-    const inputType = q.type === "multiple" ? "checkbox" : "radio";
-    return `
-      <label class="option ${cls}">
-        <input type="${inputType}" name="q-${q.id}" ${selected ? "checked" : ""} onchange="selectOption(${q.id},'${letter}')">
-        <span><b>${letter}.</b> ${esc(text)}</span>
-      </label>
-    `;
-  }).join("")}</div>`;
-}
-
-function renderEssay(q, ans) {
-  return `
-    <textarea id="essay-${q.id}" rows="6" maxlength="1000" placeholder="可先写下自己的答题要点，再提交查看参考解析。" oninput="updateEssay(${q.id})">${esc(ans.selected?.[0] || "")}</textarea>
-    ${ans.submitted ? `<div class="essay-answer"><b>参考要点：</b>${esc(q.explanation || q.answerText || "参考解析")}</div>
-      <div class="inline-actions" style="margin-top:10px">
-        <button class="btn secondary" onclick="gradeEssay(${q.id}, true)">我已掌握</button>
-        <button class="btn ghost" onclick="gradeEssay(${q.id}, false)">仍需复习</button>
-      </div>` : ""}
-  `;
-}
-
-function renderResult(q, ans) {
-  if (ans.submitted && ans.dirty) return `<div class="hint" style="margin-top:14px">答案已修改，请点击“重新提交”同步更新错题次数和复习时间。</div>`;
-  if (!ans.submitted || ans.correct === undefined) return "";
-  const correctText = ans.correct ? "回答正确" : "回答错误";
-  const cls = ans.correct ? "success" : "danger-soft";
-  return `
-    <div class="result-box ${cls}">
-      <b>${correctText}</b><br>
-      正确答案：${esc(answerDisplay(q))}
-    </div>
-    <div class="inline-actions" style="margin-top:12px">
-      <button class="btn secondary" onclick="generateInsight(${q.id})">提炼本题考点</button>
-      <button class="btn ghost" onclick="toggleFavorite(${q.id})">${isFavorited(q.id) ? "★ 已收藏" : "☆ 收藏本题"}</button>
-      <button class="btn ghost" onclick="state.noteEditorId=${q.id};render()">${noteOf(q.id) ? "编辑备注" : "添加备注"}</button>
-    </div>
-    ${isFavorited(q.id) ? `<div class="badge good" style="margin-top:10px">已收藏</div>` : ""}
-    ${ans.insight ? `<div class="insight-box"><b>考点提炼</b><br>${esc(ans.insight).replaceAll("\n", "<br>")}</div>` : ""}
-    ${renderNote(q.id)}
-  `;
-}
-
-function renderNote(questionId) {
-  const note = noteOf(questionId);
-  if (state.noteEditorId === Number(questionId)) {
-    return `
-      <div class="note-box">
-        <b>我的备注</b>
-        <textarea id="note-editor-${questionId}" rows="5" maxlength="500" placeholder="写下知识点总结、易错提醒或解题技巧。">${esc(note?.note || "")}</textarea>
-        <div class="inline-actions">
-          <button class="btn primary small" onclick="saveNote(${questionId})">保存</button>
-          <button class="btn ghost small" onclick="state.noteEditorId=null;render()">取消</button>
-          <button class="btn danger small" onclick="deleteNote(${questionId})">清空删除</button>
-        </div>
-      </div>
-    `;
-  }
-  if (!note) return "";
-  return `<div class="note-box"><b>我的备注</b><br>${esc(note.note).replaceAll("\n", "<br>")}<br><span class="muted">更新于 ${formatTime(note.updateTime)}</span></div>`;
-}
-
-function renderReview() {
-  const ids = new Set(selectedQuestionIds(state.reviewNodeIds));
-  const items = reviewQuestions().filter((q) => ids.has(q.id));
-  return pageTitle("今日复习", "新错题立即进入，可随时巩固；到期题会排在前面", `<button class="btn primary" onclick="startReview()">开始复习</button>`) + `
-    <div class="split">
-      <section class="panel">
-        <h3>复习层级筛选</h3>
-        <button class="btn small ghost" onclick="clearNodeSelection('reviewNodeIds')">全部错题</button>
-        <div class="tree" style="margin-top:10px">${renderTree(HIERARCHY, "reviewNodeIds")}</div>
-      </section>
-      <section class="panel">
-        <h3>待复习清单（${items.length}）</h3>
-        ${items.length ? renderQuestionList(items, "review") : `<div class="empty">暂无待复习错题。做错后会立刻出现在这里。</div>`}
-      </section>
-    </div>
-  `;
-}
-
-function renderWrongbook() {
-  const s = stats();
-  const ids = new Set(selectedQuestionIds(state.wrongNodeIds));
-  const items = s.wrongQuestions.map((rec) => ({ ...questionById(rec.id), ...rec })).filter((q) => q.id && ids.has(q.id));
-  return pageTitle("错题本", "所有做错过的题会自动归档，可按任意层级筛选", `<button class="btn ghost" onclick="exportWrongbook()">导出 Word</button><button class="btn ghost" onclick="window.print()">打印/PDF</button>`) + `
-    <div class="split">
-      <section class="panel">
-        <h3>错题层级筛选</h3>
-        <button class="btn small ghost" onclick="clearNodeSelection('wrongNodeIds')">全部错题</button>
-        <div class="tree" style="margin-top:10px">${renderTree(HIERARCHY, "wrongNodeIds")}</div>
-      </section>
-      <section class="panel">
-        <h3>错题列表（${items.length}）</h3>
-        ${items.length ? renderQuestionList(items, "wrong") : `<div class="empty">当前筛选下没有错题。</div>`}
-      </section>
-    </div>
-  `;
-}
-
-function renderQuestionList(items, source) {
-  return `<div class="list">${items.map((q) => `
-    <div class="list-item">
-      <div class="question-meta">
-        <span class="badge brand">${esc(q.typeLabel)}</span>
-        <span class="badge">${esc(q.pathKey)}</span>
-        ${q.wrongCount ? `<span class="badge bad">错 ${q.wrongCount} 次</span>` : ""}
-        ${q.nextReviewAt ? `<span class="badge">下次 ${formatTime(q.nextReviewAt)}</span>` : ""}
-      </div>
-      <b>${esc(compactText(q.stem, 120))}</b>
-      ${noteOf(q.id) ? `<div class="note-box">${esc(noteOf(q.id).note)}</div>` : ""}
-      <div class="inline-actions" style="margin-top:10px">
-        <button class="btn secondary small" onclick="${source === "review" ? `startQuiz('review',[${q.id}])` : source === "favorite" ? `startFavorite(${q.id})` : `startWrong(${q.id})`}">刷这题</button>
-        <button class="btn ghost small" onclick="toggleFavorite(${q.id})">${isFavorited(q.id) ? "★ 已收藏" : "☆ 收藏"}</button>
-        <button class="btn ghost small" onclick="state.noteEditorId=${q.id};render()">备注</button>
-      </div>
-      ${state.noteEditorId === q.id ? renderNote(q.id) : ""}
-    </div>
-  `).join("")}</div>`;
-}
-
-function renderFavorites() {
-  const items = favoriteQuestions();
-  const grouped = new Map();
-  items.forEach((q) => {
-    const key = q.path.slice(0, 3).join(" / ");
-    grouped.set(key, grouped.get(key) || []);
-    grouped.get(key).push(q);
-  });
-  const content = [...grouped.entries()].map(([group, qs]) => `
-    <section class="panel">
-      <h3>${esc(group)} <span class="badge">${qs.length}题</span></h3>
-      ${renderQuestionList(qs, "favorite")}
-    </section>
-  `).join("");
-  return pageTitle("我的收藏", "按层级自动分组，可集中复盘重点题", `<button class="btn primary" onclick="startFavorite()">刷收藏题</button><button class="btn danger" onclick="clearFavorites()">批量取消收藏</button>`) + (items.length ? `<div class="grid">${content}</div>` : `<div class="empty">还没有收藏题目。提交答案后可收藏。</div>`);
-}
-
-function clearFavorites() {
-  if (!confirm("确认取消全部收藏？备注不会删除。")) return;
-  const data = getUserData();
-  data.favorites = [];
-  saveUserData(data);
-  render();
-}
-
-function renderStats() {
-  const s = stats();
-  return pageTitle("学习统计", "全局统计 + 全层级穿透统计 + 薄弱层级排行") + `
-    <div class="grid cols-3">
-      ${metric("累计作答", s.attempts, "次")}
-      ${metric("已覆盖题目", s.answeredQuestions, `/${BANK.length}`)}
-      ${metric("错题数量", s.wrongCount, "题")}
-    </div>
-    <div class="grid cols-2" style="margin-top:14px">
-      <section class="panel"><h3>个人高频错题 TOP20</h3>${s.topWrong.length ? topWrongTable(s.topWrong) : `<div class="empty">暂无错题。</div>`}</section>
-      <section class="panel"><h3>答题趋势</h3>${trendTable(s.answerLog)}</section>
-    </div>
-    <section class="panel" style="margin-top:14px"><h3>层级穿透统计</h3>${renderHierarchyStatsTable(s.hierarchyStats)}</section>
-  `;
-}
-
-function renderHierarchyStatsTable(rows) {
-  return `<div class="table-wrap"><table>
-    <thead><tr><th>层级</th><th>题量</th><th>完成率</th><th>正确率</th><th>错题</th><th>掌握</th></tr></thead>
-    <tbody>${rows.map((row) => `
-      <tr>
-        <td style="padding-left:${10 + row.depth * 12}px">${esc(row.name)}<br><span class="muted">${esc(row.path)}</span></td>
-        <td>${row.total}</td>
-        <td><div class="bar"><span style="width:${Math.round(row.completion * 100)}%"></span></div>${Math.round(row.completion * 100)}%</td>
-        <td>${row.accuracy === null ? "-" : Math.round(row.accuracy * 100) + "%"}</td>
-        <td>${row.wrong}</td>
-        <td>${row.mastered}</td>
-      </tr>`).join("")}
-    </tbody>
-  </table></div>`;
-}
-
-function topWrongTable(items) {
-  return `<div class="table-wrap"><table><thead><tr><th>题目</th><th>错次</th><th>操作</th></tr></thead><tbody>
-    ${items.map((q) => `<tr><td><span class="badge">${esc(q.pathKey)}</span><br>${esc(compactText(q.stem, 90))}</td><td>${q.wrongCount}</td><td><button class="btn small secondary" onclick="startWrong(${q.id})">再刷</button></td></tr>`).join("")}
-  </tbody></table></div>`;
-}
-
-function trendTable(log) {
-  const map = new Map();
-  (log || []).forEach((item) => {
-    const day = formatDate(item.at);
-    const row = map.get(day) || { day, total: 0, correct: 0 };
-    row.total += 1;
-    if (item.correct) row.correct += 1;
-    map.set(day, row);
-  });
-  const rows = [...map.values()].slice(-14).reverse();
-  if (!rows.length) return `<div class="empty">暂无趋势数据。</div>`;
-  return `<table><thead><tr><th>日期</th><th>作答</th><th>正确率</th></tr></thead><tbody>${rows.map((r) => `<tr><td>${r.day}</td><td>${r.total}</td><td>${Math.round((r.correct / r.total) * 100)}%</td></tr>`).join("")}</tbody></table>`;
-}
-
-function renderInsights() {
-  const md = batchInsightMarkdown();
-  return pageTitle("考点提炼", "单题提炼之外，也可以按层级批量生成背诵提纲", `<button class="btn ghost" onclick="exportInsightMarkdown()">导出 Markdown</button>`) + `
-    <div class="split">
-      <section class="panel">
-        <h3>提炼范围</h3>
-        <div class="field">
-          <label><input type="radio" style="width:auto" name="scope" ${state.insightScope === "selected" ? "checked" : ""} onchange="state.insightScope='selected';render()"> 当前层级选题</label>
-          <label><input type="radio" style="width:auto" name="scope" ${state.insightScope === "wrong" ? "checked" : ""} onchange="state.insightScope='wrong';render()"> 只汇总错题</label>
-        </div>
-        <div class="tree">${renderTree(HIERARCHY, "selectedNodeIds")}</div>
-      </section>
-      <section class="panel">
-        <h3>分层级背诵提纲预览</h3>
-        <textarea rows="22" readonly>${esc(md)}</textarea>
-      </section>
-    </div>
-  `;
-}
-
-function renderResources() {
-  return pageTitle("备考资料", "来自题库工作簿的高频考点、易混点与资料来源") + `
-    <div class="grid">
-      <section class="panel"><h3>高频考点</h3>${resourceTable(KNOWLEDGE_SUMMARY)}</section>
-      <section class="panel"><h3>易混知识点</h3>${resourceTable(CONFUSION_POINTS)}</section>
-      <section class="panel"><h3>资料来源</h3>${resourceTable(SOURCE_REFERENCES)}</section>
-    </div>
-  `;
-}
-
-function resourceTable(rows) {
-  if (!rows?.length) return `<div class="empty">暂无数据。</div>`;
-  const headers = Object.keys(rows[0]);
-  return `<div class="table-wrap"><table><thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${headers.map((h) => `<td>${esc(row[h])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
-}
-
-function renderAdmin() {
-  if (state.user.role !== "super") {
-    return pageTitle("本地管理", "普通用户无题库管理权限") + `<div class="empty">只有管理员可以查看本页。</div>`;
-  }
-  const override = readJson(STORAGE.bankOverride, null);
-  return pageTitle("本地管理", "静态部署环境下，管理功能以本机导入/导出和备份为主") + `
-    <div class="grid cols-2">
-      <section class="panel">
-        <h3>题库管理</h3>
-        <p>当前题库：${BANK.length} 题 ${override ? `（本机覆盖导入于 ${formatTime(override.importedAt)}）` : "（内置 data.js）"}</p>
-        <div class="inline-actions">
-          <button class="btn secondary" onclick="exportBankJson()">导出题库 JSON</button>
-          <label class="btn ghost">导入题库 JSON<input type="file" accept=".json" style="display:none" onchange="importBank(this)"></label>
-          ${override ? `<button class="btn danger" onclick="clearBankOverride()">清除本机覆盖</button>` : ""}
-        </div>
-        <p class="muted">批量更新推荐流程：修改 Excel → 运行 generate_data.py → 提交 data.js 到 GitHub Pages。</p>
-      </section>
-      <section class="panel">
-        <h3>数据备份</h3>
-        <div class="inline-actions">
-          <button class="btn secondary" onclick="exportBackup()">一键备份全部本地数据</button>
-          <label class="btn ghost">恢复备份<input type="file" accept=".json" style="display:none" onchange="importBackup(this)"></label>
-        </div>
-      </section>
-      <section class="panel">
-        <h3>用户列表</h3>
-        <table><thead><tr><th>用户名</th><th>角色</th><th>创建时间</th></tr></thead><tbody>
-          ${users().map((u) => `<tr><td>${esc(u.username)}</td><td>${esc(u.role || "user")}</td><td>${formatTime(u.createdAt)}</td></tr>`).join("")}
-        </tbody></table>
-      </section>
-      <section class="panel">
-        <h3>层级树概览</h3>
-        <div class="tree">${renderTree(HIERARCHY, "selectedNodeIds")}</div>
-      </section>
-    </div>
-  `;
 }
 
 function render() {
@@ -1406,27 +1405,26 @@ function render() {
     app.innerHTML = renderAuth();
     return;
   }
-  let content = "";
-  if (state.view === "dashboard") content = renderDashboard();
-  else if (state.view === "practice") content = renderPractice();
-  else if (state.view === "review") content = renderReview();
-  else if (state.view === "wrongbook") content = renderWrongbook();
-  else if (state.view === "favorites") content = renderFavorites();
-  else if (state.view === "stats") content = renderStats();
-  else if (state.view === "insights") content = renderInsights();
-  else if (state.view === "resources") content = renderResources();
-  else if (state.view === "admin") content = renderAdmin();
-  app.innerHTML = renderLayout(content);
+  const pages = {
+    dashboard: renderDashboard,
+    practice: renderPractice,
+    wrongbook: renderWrongbook,
+    favorites: renderFavorites,
+    stats: renderStats,
+    insights: renderInsights,
+    admin: renderAdmin,
+  };
+  app.innerHTML = renderLayout((pages[state.view] || renderDashboard)());
 }
 
 async function boot() {
   await ensureAdmin();
   const session = readJson(STORAGE.session, null);
   if (session?.username && session.expiresAt > Date.now()) {
-    const item = users().find((u) => u.username === session.username);
-    if (item) {
-      state.user = { username: item.username, role: item.role || (item.username === "admin" ? "super" : "user") };
-      loadQuiz(item.username);
+    const user = users().find((u) => u.username === session.username);
+    if (user) {
+      state.user = { username: user.username, role: user.role || (user.username === "admin" ? "super" : "user") };
+      loadRound(user.username);
       syncRecords();
     }
   }
