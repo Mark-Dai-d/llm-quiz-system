@@ -8,6 +8,7 @@ const STORAGE = {
   users: "llm_quiz_users_v2",
   session: "llm_quiz_session_v2",
   bankOverride: "llm_quiz_bank_override_v2",
+  publicNotes: "llm_quiz_public_notes_v1",
   data: (username) => `llm_quiz_learning_v2_${username}`,
   round: (username) => `llm_quiz_round_v2_${username}`,
 };
@@ -24,6 +25,69 @@ function esc(value) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function textToNoteHtml(value) {
+  return esc(value || "").replaceAll("\n", "<br>");
+}
+
+function sanitizeNoteHtml(value) {
+  const html = String(value || "");
+  if (typeof document === "undefined") return textToNoteHtml(html);
+  const source = document.createElement("template");
+  source.innerHTML = html;
+  const output = document.createElement("div");
+  const allowed = new Set(["B", "STRONG", "BR", "P", "DIV", "IMG"]);
+
+  function copyNode(node, parent) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parent.appendChild(document.createTextNode(node.textContent || ""));
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (!allowed.has(node.tagName)) {
+      [...node.childNodes].forEach((child) => copyNode(child, parent));
+      return;
+    }
+    if (node.tagName === "IMG") {
+      const src = node.getAttribute("src") || "";
+      if (!/^data:image\/(jpeg|png|webp);base64,/i.test(src)) return;
+      const image = document.createElement("img");
+      image.src = src;
+      image.alt = node.getAttribute("alt") || "备注图片";
+      parent.appendChild(image);
+      return;
+    }
+    const tag = node.tagName === "B" ? "strong" : node.tagName.toLowerCase();
+    const element = document.createElement(tag);
+    [...node.childNodes].forEach((child) => copyNode(child, element));
+    parent.appendChild(element);
+  }
+
+  [...source.content.childNodes].forEach((node) => copyNode(node, output));
+  return output.innerHTML;
+}
+
+function plainTextFromNoteHtml(value) {
+  if (typeof document === "undefined") return String(value || "").replace(/<[^>]*>/g, " ").trim();
+  const element = document.createElement("div");
+  element.innerHTML = sanitizeNoteHtml(value);
+  return (element.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeNote(raw, questionId, author = state.user?.username || "") {
+  if (!raw) return null;
+  const legacyText = typeof raw === "string" ? raw : (raw.note || raw.text || "");
+  const html = sanitizeNoteHtml(typeof raw === "object" && raw.html ? raw.html : textToNoteHtml(legacyText));
+  if (!plainTextFromNoteHtml(html) && !/<img\b/i.test(html)) return null;
+  return {
+    questionId: Number(questionId),
+    author: (typeof raw === "object" && raw.author) || author,
+    html,
+    text: plainTextFromNoteHtml(html),
+    isPublic: Boolean(typeof raw === "object" && raw.isPublic),
+    updateTime: (typeof raw === "object" && raw.updateTime) || nowIso(),
+  };
 }
 
 function readJson(key, fallback) {
@@ -167,6 +231,8 @@ const state = {
   customCount: "",
   round: null,
   noteEditorId: null,
+  expandedPublicNoteQuestions: new Set(),
+  selectedPublicNoteIds: new Set(),
   insightScope: "filtered",
 };
 
@@ -179,6 +245,7 @@ const nav = [
   ["favorites", "我的收藏"],
   ["stats", "学习统计"],
   ["insights", "考点提炼"],
+  ["publicnotes", "我的公开备注"],
   ["admin", "本地管理"],
 ];
 
@@ -412,27 +479,208 @@ function toggleFavorite(questionId) {
 }
 
 function noteOf(questionId) {
-  return data().notes?.[String(questionId)] || null;
+  return normalizeNote(data().notes?.[String(questionId)], questionId, state.user?.username);
+}
+
+function showNoteEditorError(questionId, message) {
+  const target = document.getElementById(`note-error-${questionId}`);
+  if (target) {
+    target.textContent = message;
+    target.hidden = false;
+  } else {
+    alert(message);
+  }
 }
 
 function saveNote(questionId) {
-  const input = document.getElementById(`note-editor-${questionId}`);
-  const note = (input?.value || "").trim();
-  if (note.length > 500) return showError("备注最多 500 字。");
+  const editor = document.getElementById(`note-editor-${questionId}`);
+  const html = sanitizeNoteHtml(editor?.innerHTML || "");
+  const text = plainTextFromNoteHtml(html);
+  const hasImage = /<img\b/i.test(html);
+  const imageCount = (html.match(/<img\b/gi) || []).length;
+  if (text.length > 500) return showNoteEditorError(questionId, "备注文字最多 500 字。");
+  if (imageCount > 3) return showNoteEditorError(questionId, "每条备注最多插入 3 张图片。");
+  if (html.length > 2.6 * 1024 * 1024) return showNoteEditorError(questionId, "备注图片总量过大，请删除部分图片后再保存。");
   const d = data();
-  if (note) d.notes[String(questionId)] = { note, updateTime: nowIso() };
-  else delete d.notes[String(questionId)];
+  const isPublic = Boolean(document.getElementById(`note-public-${questionId}`)?.checked);
+  try {
+    if (text || hasImage) {
+      const note = {
+        questionId: Number(questionId),
+        author: state.user.username,
+        html,
+        text,
+        isPublic,
+        updateTime: nowIso(),
+      };
+      d.notes[String(questionId)] = note;
+      saveData(d);
+      syncPublicNote(note);
+    } else {
+      delete d.notes[String(questionId)];
+      saveData(d);
+      removePublicNote(questionId, state.user.username);
+    }
+  } catch {
+    const fallback = normalizeNote(d.notes?.[String(questionId)], questionId, state.user.username);
+    if (fallback) {
+      fallback.isPublic = false;
+      d.notes[String(questionId)] = fallback;
+      try { saveData(d); } catch {}
+    }
+    removePublicNote(questionId, state.user.username);
+    return showNoteEditorError(questionId, "浏览器存储空间不足，图片备注未能完整保存。请删除部分图片或备份后清理数据。");
+  }
   state.noteEditorId = null;
-  saveData(d);
-  showToast(note ? "备注已保存" : "备注已删除");
+  showToast(text || hasImage ? (isPublic ? "备注已保存并公开" : "私有备注已保存") : "备注已删除");
 }
 
 function deleteNote(questionId) {
   const d = data();
   delete d.notes[String(questionId)];
+  removePublicNote(questionId, state.user.username);
   state.noteEditorId = null;
   saveData(d);
   showToast("备注已删除");
+}
+
+function publicNotes() {
+  return (readJson(STORAGE.publicNotes, []) || [])
+    .map((entry) => {
+      const authorData = data(entry.author);
+      return normalizeNote(authorData.notes?.[String(entry.questionId)], entry.questionId, entry.author);
+    })
+    .filter((note) => note?.isPublic && note.author && q(note.questionId));
+}
+
+function savePublicNotes(items) {
+  writeJson(STORAGE.publicNotes, items);
+}
+
+function syncPublicNote(note) {
+  const items = publicNotes().filter((item) => !(item.questionId === Number(note.questionId) && item.author === note.author));
+  const index = items.map((item) => ({ questionId: item.questionId, author: item.author, updateTime: item.updateTime }));
+  if (note.isPublic) index.push({ questionId: Number(note.questionId), author: note.author, updateTime: note.updateTime });
+  savePublicNotes(index);
+}
+
+function removePublicNote(questionId, author = state.user?.username) {
+  const index = (readJson(STORAGE.publicNotes, []) || []).filter((item) => !(Number(item.questionId) === Number(questionId) && item.author === author));
+  savePublicNotes(index);
+}
+
+function publicNotesForQuestion(questionId) {
+  return publicNotes()
+    .filter((note) => note.questionId === Number(questionId) && note.author !== state.user?.username)
+    .sort((a, b) => new Date(b.updateTime) - new Date(a.updateTime));
+}
+
+function toggleNotePublic(questionId, isPublic) {
+  const d = data();
+  const note = normalizeNote(d.notes?.[String(questionId)], questionId, state.user.username);
+  if (!note) return showError("请先保存备注，再设置公开状态。");
+  note.isPublic = Boolean(isPublic);
+  note.updateTime = nowIso();
+  d.notes[String(questionId)] = note;
+  saveData(d);
+  syncPublicNote(note);
+  showToast(note.isPublic ? "备注已公开" : "备注已设为私有");
+}
+
+function togglePublicNotes(questionId) {
+  const id = Number(questionId);
+  state.expandedPublicNoteQuestions.has(id) ? state.expandedPublicNoteQuestions.delete(id) : state.expandedPublicNoteQuestions.add(id);
+  render();
+}
+
+const noteRanges = new Map();
+
+function rememberNoteSelection(questionId) {
+  const selection = window.getSelection();
+  const editor = document.getElementById(`note-editor-${questionId}`);
+  if (!selection?.rangeCount || !editor) return;
+  const range = selection.getRangeAt(0);
+  if (editor.contains(range.commonAncestorContainer)) noteRanges.set(Number(questionId), range.cloneRange());
+}
+
+function formatNoteBold(event, questionId) {
+  event.preventDefault();
+  const editor = document.getElementById(`note-editor-${questionId}`);
+  editor?.focus();
+  document.execCommand("bold", false, null);
+  rememberNoteSelection(questionId);
+}
+
+function insertNodeIntoNote(questionId, node) {
+  const editor = document.getElementById(`note-editor-${questionId}`);
+  if (!editor) return;
+  editor.focus();
+  const range = noteRanges.get(Number(questionId));
+  if (range && editor.contains(range.commonAncestorContainer)) {
+    range.deleteContents();
+    range.insertNode(node);
+    range.setStartAfter(node);
+    range.collapse(true);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } else {
+    editor.appendChild(node);
+  }
+  editor.appendChild(document.createElement("br"));
+  rememberNoteSelection(questionId);
+}
+
+async function compressNoteImage(file) {
+  const allowed = new Set(["image/jpeg", "image/png", "image/webp"]);
+  if (!allowed.has(file.type)) throw new Error("仅支持 JPG、PNG、WebP 图片。");
+  if (file.size > 8 * 1024 * 1024) throw new Error("原图不能超过 8MB。");
+  const bitmap = await createImageBitmap(file);
+  let width = bitmap.width;
+  let height = bitmap.height;
+  const maxSide = 1400;
+  if (Math.max(width, height) > maxSide) {
+    const ratio = maxSide / Math.max(width, height);
+    width = Math.round(width * ratio);
+    height = Math.round(height * ratio);
+  }
+  let quality = 0.84;
+  let dataUrl = "";
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width));
+    canvas.height = Math.max(1, Math.round(height));
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    dataUrl = canvas.toDataURL("image/webp", quality);
+    if (dataUrl.length <= 900 * 1024) break;
+    width *= 0.8;
+    height *= 0.8;
+    quality = Math.max(0.58, quality - 0.08);
+  }
+  bitmap.close?.();
+  if (dataUrl.length > 900 * 1024) throw new Error("图片压缩后仍过大，请换一张尺寸更小的图片。");
+  return dataUrl;
+}
+
+async function insertNoteImage(file, questionId) {
+  if (!file) return;
+  try {
+    const dataUrl = await compressNoteImage(file);
+    const image = document.createElement("img");
+    image.src = dataUrl;
+    image.alt = "备注图片";
+    insertNodeIntoNote(questionId, image);
+    showToast("图片已插入，请保存备注");
+  } catch (error) {
+    showNoteEditorError(questionId, error.message || "图片插入失败。");
+  }
+}
+
+function handleNotePaste(event, questionId) {
+  const imageItem = [...(event.clipboardData?.items || [])].find((item) => item.type.startsWith("image/"));
+  if (!imageItem) return;
+  event.preventDefault();
+  insertNoteImage(imageItem.getAsFile(), questionId);
 }
 
 function markMastered(questionId, mastered) {
@@ -1053,15 +1301,58 @@ function renderResult(question, ans) {
     </div>
     ${ans.insight ? `<div class="insight-box"><b>考点提炼</b><br>${esc(ans.insight).replaceAll("\n", "<br>")}</div>` : ""}
     ${renderNote(question.id)}
+    ${renderPublicNotes(question.id)}
   `;
 }
 
 function renderNote(questionId) {
   const note = noteOf(questionId);
   if (state.noteEditorId === Number(questionId)) {
-    return `<div class="note-box"><b>我的备注</b><textarea id="note-editor-${questionId}" rows="5" maxlength="500">${esc(note?.note || "")}</textarea><div class="inline-actions"><button class="btn primary small" onclick="saveNote(${questionId})">保存</button><button class="btn ghost small" onclick="state.noteEditorId=null;render()">取消</button><button class="btn danger small" onclick="deleteNote(${questionId})">清空删除</button></div></div>`;
+    return `
+      <div class="note-box my-note-box">
+        <div class="note-heading"><b>我的备注</b><span class="badge">仅你可编辑</span></div>
+        <div class="rich-toolbar">
+          <button class="btn ghost small" onmousedown="formatNoteBold(event, ${questionId})"><b>B</b> 加粗</button>
+          <label class="btn ghost small">插入图片<input type="file" accept="image/jpeg,image/png,image/webp" style="display:none" onchange="insertNoteImage(this.files[0], ${questionId});this.value='' "></label>
+          <span class="muted">支持粘贴图片，文字最多 500 字</span>
+        </div>
+        <div id="note-editor-${questionId}" class="rich-editor" contenteditable="true" role="textbox" aria-multiline="true" onmouseup="rememberNoteSelection(${questionId})" onkeyup="rememberNoteSelection(${questionId})" oninput="rememberNoteSelection(${questionId})" onpaste="handleNotePaste(event, ${questionId})">${note?.html || ""}</div>
+        <div id="note-error-${questionId}" class="error" hidden></div>
+        <label class="public-switch"><input id="note-public-${questionId}" type="checkbox" ${note?.isPublic ? "checked" : ""}> 公开分享给其他用户</label>
+        <div class="inline-actions">
+          <button class="btn primary small" onclick="saveNote(${questionId})">保存</button>
+          <button class="btn ghost small" onclick="state.noteEditorId=null;render()">取消</button>
+          <button class="btn danger small" onclick="deleteNote(${questionId})">清空删除</button>
+        </div>
+      </div>`;
   }
-  return note ? `<div class="note-box"><b>我的备注</b><br>${esc(note.note).replaceAll("\n", "<br>")}<br><span class="muted">更新于 ${fmtTime(note.updateTime)}</span></div>` : "";
+  return note ? `
+    <div class="note-box my-note-box">
+      <div class="note-heading"><b>我的备注</b><span class="badge ${note.isPublic ? "good" : ""}">${note.isPublic ? "已公开" : "仅自己可见"}</span></div>
+      <div class="note-content">${note.html}</div>
+      <div class="note-footer">
+        <span class="muted">更新于 ${fmtTime(note.updateTime)}</span>
+        <label class="public-switch"><input type="checkbox" ${note.isPublic ? "checked" : ""} onchange="toggleNotePublic(${questionId}, this.checked)"> 公开分享</label>
+      </div>
+    </div>` : "";
+}
+
+function renderPublicNotes(questionId) {
+  const notes = publicNotesForQuestion(questionId);
+  if (!notes.length) return "";
+  const expanded = state.expandedPublicNoteQuestions.has(Number(questionId));
+  return `
+    <section class="public-notes-box">
+      <button class="public-notes-toggle" onclick="togglePublicNotes(${questionId})">
+        <span><b>其他用户公开备注</b> <span class="badge">${notes.length}条</span></span>
+        <span>${expanded ? "收起" : "展开"}</span>
+      </button>
+      ${expanded ? `<div class="public-note-list">${notes.map((note) => `
+        <article class="public-note-item">
+          <div class="note-heading"><b>${esc(note.author)}</b><span class="muted">更新于 ${fmtTime(note.updateTime)}</span></div>
+          <div class="note-content">${note.html}</div>
+        </article>`).join("")}</div>` : ""}
+    </section>`;
 }
 
 function renderWrongbook() {
@@ -1090,7 +1381,7 @@ function renderQuestionList(items, source = "wrong") {
         ${rec.mastered ? `<span class="badge good">已掌握</span>` : ""}
       </div>
       <b>${esc(compact(question.stem, 120))}</b>
-      ${noteOf(question.id) ? `<div class="note-box">${esc(noteOf(question.id).note)}</div>` : ""}
+      ${noteOf(question.id) && state.noteEditorId !== question.id ? `<div class="note-box my-note-box"><div class="note-heading"><b>我的备注</b><span class="badge ${noteOf(question.id).isPublic ? "good" : ""}">${noteOf(question.id).isPublic ? "已公开" : "私有"}</span></div><div class="note-content">${noteOf(question.id).html}</div></div>` : ""}
       <div class="inline-actions" style="margin-top:10px">
         <button class="btn secondary small" onclick="startRound('${source === "favorite" ? "favorite" : "wrong"}',[${question.id}])">刷这题</button>
         <button class="btn ghost small" onclick="toggleFavorite(${question.id})">${isFavorited(question.id) ? "★ 已收藏" : "☆ 收藏"}</button>
@@ -1098,6 +1389,7 @@ function renderQuestionList(items, source = "wrong") {
         <button class="btn ghost small" onclick="state.noteEditorId=${question.id};render()">备注</button>
       </div>
       ${state.noteEditorId === question.id ? renderNote(question.id) : ""}
+      ${renderPublicNotes(question.id)}
     </div>`;
   }).join("")}</div>`;
 }
@@ -1124,6 +1416,92 @@ function clearFavorites() {
   d.favorites = [];
   saveData(d);
   render();
+}
+
+function myPublicNotes() {
+  const d = data();
+  return Object.entries(d.notes || {})
+    .map(([questionId, raw]) => normalizeNote(raw, questionId, state.user.username))
+    .filter((note) => note?.isPublic && note.author === state.user.username)
+    .sort((a, b) => new Date(b.updateTime) - new Date(a.updateTime));
+}
+
+function togglePublicNoteSelection(questionId) {
+  const id = Number(questionId);
+  state.selectedPublicNoteIds.has(id) ? state.selectedPublicNoteIds.delete(id) : state.selectedPublicNoteIds.add(id);
+  render();
+}
+
+function selectAllPublicNotes(checked) {
+  state.selectedPublicNoteIds = checked ? new Set(myPublicNotes().map((note) => note.questionId)) : new Set();
+  render();
+}
+
+function batchClosePublicNotes() {
+  const ids = new Set(state.selectedPublicNoteIds);
+  if (!ids.size) return showError("请先选择公开备注。");
+  const d = data();
+  for (const id of ids) {
+    const note = normalizeNote(d.notes?.[String(id)], id, state.user.username);
+    if (!note || note.author !== state.user.username) continue;
+    note.isPublic = false;
+    note.updateTime = nowIso();
+    d.notes[String(id)] = note;
+    removePublicNote(id, state.user.username);
+  }
+  saveData(d);
+  state.selectedPublicNoteIds.clear();
+  showToast("所选备注已关闭公开");
+}
+
+function batchDeletePublicNotes() {
+  const ids = new Set(state.selectedPublicNoteIds);
+  if (!ids.size) return showError("请先选择公开备注。");
+  if (!confirm(`确认删除所选 ${ids.size} 条备注？删除后无法恢复。`)) return;
+  const d = data();
+  for (const id of ids) {
+    const note = normalizeNote(d.notes?.[String(id)], id, state.user.username);
+    if (!note || note.author !== state.user.username) continue;
+    delete d.notes[String(id)];
+    removePublicNote(id, state.user.username);
+  }
+  saveData(d);
+  state.selectedPublicNoteIds.clear();
+  showToast("所选公开备注已删除");
+}
+
+function renderMyPublicNotes() {
+  const notes = myPublicNotes();
+  const allSelected = notes.length > 0 && notes.every((note) => state.selectedPublicNoteIds.has(note.questionId));
+  return pageTitle("我的公开备注", "集中管理自己发布的公开备注，其他用户始终只有只读权限", `
+    <button class="btn ghost" onclick="batchClosePublicNotes()">批量关闭公开</button>
+    <button class="btn danger" onclick="batchDeletePublicNotes()">批量删除</button>`) + `
+    <section class="panel">
+      <div class="public-manage-toolbar">
+        <label><input type="checkbox" style="width:auto" ${allSelected ? "checked" : ""} onchange="selectAllPublicNotes(this.checked)"> 全选</label>
+        <span class="muted">已选择 ${state.selectedPublicNoteIds.size} 条，共 ${notes.length} 条公开备注</span>
+      </div>
+      ${notes.length ? `<div class="list">${notes.map((note) => {
+        const question = q(note.questionId);
+        return `<article class="list-item public-manage-item">
+          <input type="checkbox" ${state.selectedPublicNoteIds.has(note.questionId) ? "checked" : ""} onchange="togglePublicNoteSelection(${note.questionId})">
+          <div>
+            <div class="question-meta">
+              <span class="badge ${DIFFICULTY_COLORS[question.difficultyLayer]}">${esc(question.difficultyLayer)}</span>
+              <span class="badge brand">${esc(question.questionType)}</span>
+              <span class="badge">${esc(question.categoryKey)}</span>
+            </div>
+            <b>${esc(compact(question.stem, 130))}</b>
+            <div class="note-box my-note-box"><div class="note-heading"><b>公开内容</b><span class="muted">更新于 ${fmtTime(note.updateTime)}</span></div><div class="note-content">${note.html}</div></div>
+            <div class="inline-actions">
+              <button class="btn ghost small" onclick="toggleNotePublic(${note.questionId}, false)">关闭公开</button>
+              <button class="btn secondary small" onclick="state.view='practice';startRound('hierarchy',[${note.questionId}])">打开原题</button>
+              <button class="btn ghost small" onclick="state.noteEditorId=${note.questionId};state.view='practice';startRound('hierarchy',[${note.questionId}])">编辑备注</button>
+            </div>
+          </div>
+        </article>`;
+      }).join("")}</div>` : `<div class="empty">你还没有公开备注。备注默认私有，只有主动开启公开后才会出现在这里。</div>`}
+    </section>`;
 }
 
 function renderStats() {
@@ -1234,7 +1612,7 @@ function downloadText(filename, content, type = "text/plain;charset=utf-8") {
 
 function exportWrongbook() {
   const rows = stats().wrongItems.map((rec) => ({ ...q(rec.id), ...rec }));
-  const htmlRows = rows.map((question) => `<tr><td>${esc(question.difficultyLayer)}</td><td>${esc(question.categoryKey)}</td><td>${esc(question.questionType)}</td><td>${esc(question.stem)}</td><td>${esc(answerText(question))}</td><td>${question.wrongCount}</td><td>${question.mastered ? "已掌握" : "未掌握"}</td><td>${esc(noteOf(question.id)?.note || "")}</td></tr>`).join("");
+  const htmlRows = rows.map((question) => `<tr><td>${esc(question.difficultyLayer)}</td><td>${esc(question.categoryKey)}</td><td>${esc(question.questionType)}</td><td>${esc(question.stem)}</td><td>${esc(answerText(question))}</td><td>${question.wrongCount}</td><td>${question.mastered ? "已掌握" : "未掌握"}</td><td>${esc(noteOf(question.id)?.text || "")}</td></tr>`).join("");
   const html = `<html><head><meta charset="utf-8"><title>错题本</title></head><body><h1>个人错题本</h1><table border="1" cellspacing="0" cellpadding="6"><thead><tr><th>难度</th><th>知识分类</th><th>题型</th><th>题干</th><th>答案</th><th>错次</th><th>掌握状态</th><th>备注</th></tr></thead><tbody>${htmlRows}</tbody></table></body></html>`;
   downloadText("个人错题本.doc", html, "application/msword;charset=utf-8");
 }
@@ -1412,6 +1790,7 @@ function render() {
     favorites: renderFavorites,
     stats: renderStats,
     insights: renderInsights,
+    publicnotes: renderMyPublicNotes,
     admin: renderAdmin,
   };
   app.innerHTML = renderLayout((pages[state.view] || renderDashboard)());

@@ -20,6 +20,18 @@ if (String(fs.readFileSync("app.js", "utf8")).match(/REVIEW_INTERVALS|nextReview
   throw new Error("Removed review scheduling terms still exist");
 }
 
+const appSource = String(fs.readFileSync("app.js", "utf8"));
+for (const feature of [
+  "sanitizeNoteHtml",
+  "compressNoteImage",
+  "publicNotesForQuestion",
+  "renderMyPublicNotes",
+  "batchClosePublicNotes",
+  "batchDeletePublicNotes",
+]) {
+  if (!appSource.includes(`function ${feature}`)) throw new Error(`Missing note feature: ${feature}`);
+}
+
 console.log("smoke ok", {
   questions: bank.length,
   layers: meta.layerCounts,

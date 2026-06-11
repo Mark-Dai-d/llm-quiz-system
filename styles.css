@@ -635,6 +635,137 @@ textarea {
   border-left: 4px solid #aab6c6;
 }
 
+.my-note-box {
+  overflow: hidden;
+}
+
+.note-heading,
+.note-footer,
+.public-manage-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.note-footer {
+  margin-top: 10px;
+}
+
+.note-content {
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  line-height: 1.75;
+}
+
+.note-content img,
+.rich-editor img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: 720px;
+  margin: 10px 0;
+  border-radius: 6px;
+  object-fit: contain;
+}
+
+.rich-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rich-editor {
+  min-height: 150px;
+  max-height: 520px;
+  overflow: auto;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--ink);
+  line-height: 1.75;
+  outline: none;
+}
+
+.rich-editor:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(22, 103, 183, 0.1);
+}
+
+.rich-editor:empty::before {
+  content: "写下知识点总结、易错提醒或解题技巧…";
+  color: #98a2b3;
+}
+
+.public-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 10px 0;
+  color: var(--muted);
+}
+
+.public-switch input {
+  width: auto;
+}
+
+.public-notes-box {
+  margin-top: 14px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.public-notes-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  color: var(--ink);
+  background: #f8fafc;
+  text-align: left;
+}
+
+.public-note-list {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.public-note-item {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.public-manage-toolbar {
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.public-manage-item {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.public-manage-item > input {
+  width: auto;
+  margin-top: 4px;
+}
+
 .insight-box {
   background: #f8fbff;
   border: 1px solid var(--line);
