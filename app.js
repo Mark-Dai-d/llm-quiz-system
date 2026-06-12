@@ -9,6 +9,9 @@ const STORAGE = {
   session: "llm_quiz_session_v2",
   bankOverride: "llm_quiz_bank_override_v2",
   publicNotes: "llm_quiz_public_notes_v1",
+  deletedQuestionIds: "llm_quiz_deleted_question_ids_v1",
+  questionRecycleBin: "llm_quiz_question_recycle_bin_v1",
+  questionDeleteLogs: "llm_quiz_question_delete_logs_v1",
   data: (username) => `llm_quiz_learning_v2_${username}`,
   round: (username) => `llm_quiz_round_v2_${username}`,
 };
@@ -158,10 +161,19 @@ function normalizeQuestion(q, index) {
   };
 }
 
-function loadBank() {
+function deletedQuestionIds() {
+  return new Set((readJson(STORAGE.deletedQuestionIds, []) || []).map(Number).filter(Number.isFinite));
+}
+
+function loadBankSource() {
   const override = readJson(STORAGE.bankOverride, null);
   const source = override?.questions?.length ? override.questions : (window.QUESTION_BANK || []);
   return source.map(normalizeQuestion);
+}
+
+function loadBank() {
+  const deletedIds = deletedQuestionIds();
+  return loadBankSource().filter((question) => !deletedIds.has(question.id));
 }
 
 let BANK = loadBank();
@@ -233,6 +245,8 @@ const state = {
   noteEditorId: null,
   expandedPublicNoteQuestions: new Set(),
   selectedPublicNoteIds: new Set(),
+  selectedRecycleIds: new Set(),
+  deleteTargetId: null,
   insightScope: "filtered",
 };
 
@@ -322,6 +336,188 @@ function saveRound() {
   if (!state.user) return;
   if (state.round) writeJson(STORAGE.round(state.user.username), state.round);
   else localStorage.removeItem(STORAGE.round(state.user.username));
+}
+
+function questionSnapshot(question) {
+  return JSON.parse(JSON.stringify(question));
+}
+
+function recycleBin() {
+  return readJson(STORAGE.questionRecycleBin, []) || [];
+}
+
+function deleteLogs() {
+  return readJson(STORAGE.questionDeleteLogs, []) || [];
+}
+
+function purgeExpiredRecycleBin() {
+  const now = Date.now();
+  const current = recycleBin();
+  const active = current.filter((item) => new Date(item.expiresAt).getTime() > now);
+  if (active.length !== current.length) writeJson(STORAGE.questionRecycleBin, active);
+  return active;
+}
+
+function appendDeleteLog(action, question, extra = {}) {
+  const actor = state.user || {};
+  const logs = deleteLogs();
+  logs.unshift({
+    id: randomId(),
+    action,
+    questionId: Number(question.id),
+    userId: actor.username || "system",
+    nickname: actor.nickname || actor.username || "系统",
+    role: actor.role || "system",
+    at: nowIso(),
+    question: questionSnapshot(question),
+    ...extra,
+  });
+  writeJson(STORAGE.questionDeleteLogs, logs);
+}
+
+function removeQuestionFromRound(round, questionId) {
+  if (!round?.questionIds?.length) return round || null;
+  const id = Number(questionId);
+  const removedIndex = round.questionIds.findIndex((item) => Number(item) === id);
+  if (removedIndex < 0) return round;
+  round.questionIds = round.questionIds.filter((item) => Number(item) !== id);
+  delete round.answers?.[String(id)];
+  if (!round.questionIds.length) return null;
+  if (removedIndex < round.currentIndex) round.currentIndex -= 1;
+  round.currentIndex = Math.max(0, Math.min(round.currentIndex, round.questionIds.length - 1));
+  round.updatedAt = nowIso();
+  return round;
+}
+
+function removeQuestionFromUserData(username, questionId) {
+  const id = Number(questionId);
+  const d = data(username);
+  d.answerLog = (d.answerLog || []).filter((item) => Number(item.questionId) !== id);
+  delete d.records?.[String(id)];
+  delete d.notes?.[String(id)];
+  delete d.mastery?.[String(id)];
+  d.favorites = (d.favorites || []).filter((item) => Number(typeof item === "object" ? item.questionId : item) !== id);
+  d.records = rebuildRecords(d.answerLog, d.mastery);
+  saveData(d, username);
+
+  const roundKey = STORAGE.round(username);
+  const cleanedRound = removeQuestionFromRound(readJson(roundKey, null), id);
+  if (cleanedRound) writeJson(roundKey, cleanedRound);
+  else localStorage.removeItem(roundKey);
+}
+
+function reloadQuestionState() {
+  BANK = loadBank();
+  indexBank();
+  if (state.user) {
+    loadRound(state.user.username);
+    if (state.round) {
+      for (const id of [...state.round.questionIds]) {
+        if (!q(id)) state.round = removeQuestionFromRound(state.round, id);
+      }
+      saveRound();
+    }
+  }
+}
+
+function openGlobalDelete(questionId) {
+  if (!q(questionId)) return showError("该题目已被删除或不存在。");
+  state.deleteTargetId = Number(questionId);
+  render();
+}
+
+function closeGlobalDelete() {
+  state.deleteTargetId = null;
+  render();
+}
+
+function confirmGlobalDelete(questionId) {
+  const checkbox = document.getElementById("global-delete-ack");
+  if (!checkbox?.checked) return;
+  if (!confirm("最后确认：真的要让本设备内所有账号都永久失去这道题吗？")) return;
+  globalDeleteQuestion(questionId);
+}
+
+function globalDeleteQuestion(questionId) {
+  const question = q(questionId);
+  if (!question) return showError("该题目已被删除或不存在。");
+  const deletedAt = nowIso();
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const ids = deletedQuestionIds();
+  ids.add(question.id);
+  writeJson(STORAGE.deletedQuestionIds, [...ids].sort((a, b) => a - b));
+
+  const bin = purgeExpiredRecycleBin().filter((item) => Number(item.questionId) !== question.id);
+  bin.unshift({
+    questionId: question.id,
+    deletedAt,
+    expiresAt,
+    deletedBy: state.user.username,
+    deletedByNickname: state.user.nickname || state.user.username,
+    question: questionSnapshot(question),
+  });
+  writeJson(STORAGE.questionRecycleBin, bin);
+  appendDeleteLog("delete", question, { expiresAt });
+
+  for (const user of users()) removeQuestionFromUserData(user.username, question.id);
+  const publicIndex = (readJson(STORAGE.publicNotes, []) || []).filter((item) => Number(item.questionId) !== question.id);
+  writeJson(STORAGE.publicNotes, publicIndex);
+
+  state.deleteTargetId = null;
+  state.noteEditorId = null;
+  reloadQuestionState();
+  showToast("题目已全局删除，30 天内管理员可恢复");
+}
+
+function skipCurrentQuestion() {
+  const question = currentQuestion();
+  if (!question || !state.round) return;
+  if (!confirm("仅从当前刷题轮次剔除本题？公共题库和个人历史不会受影响。")) return;
+  state.round = removeQuestionFromRound(state.round, question.id);
+  saveRound();
+  showToast("已从本轮剔除，题库内容未删除");
+}
+
+function toggleRecycleSelection(questionId) {
+  const id = Number(questionId);
+  state.selectedRecycleIds.has(id) ? state.selectedRecycleIds.delete(id) : state.selectedRecycleIds.add(id);
+  render();
+}
+
+function selectAllRecycle(checked) {
+  state.selectedRecycleIds = checked ? new Set(purgeExpiredRecycleBin().map((item) => Number(item.questionId))) : new Set();
+  render();
+}
+
+function restoreDeletedQuestion(questionId, silent = false) {
+  if (state.user?.role !== "super") return showError("只有超级管理员可以恢复已删除题目。");
+  const id = Number(questionId);
+  const bin = purgeExpiredRecycleBin();
+  const item = bin.find((entry) => Number(entry.questionId) === id);
+  if (!item) return silent ? false : showError("该题目已超过 30 天保留期或不存在。");
+  const sourceBank = loadBankSource();
+  if (!sourceBank.some((question) => question.id === id)) {
+    writeJson(STORAGE.bankOverride, { questions: [...sourceBank, item.question], restoredAt: nowIso() });
+  }
+  const ids = deletedQuestionIds();
+  ids.delete(id);
+  writeJson(STORAGE.deletedQuestionIds, [...ids].sort((a, b) => a - b));
+  writeJson(STORAGE.questionRecycleBin, bin.filter((entry) => Number(entry.questionId) !== id));
+  appendDeleteLog("restore", item.question, { originalDeletedAt: item.deletedAt });
+  state.selectedRecycleIds.delete(id);
+  reloadQuestionState();
+  if (!silent) showToast("题目已恢复到公共题库");
+  return true;
+}
+
+function batchRestoreDeletedQuestions() {
+  const ids = [...state.selectedRecycleIds];
+  if (!ids.length) return showError("请先选择要恢复的题目。");
+  if (!confirm(`确认恢复选中的 ${ids.length} 道题？个人历史作答数据不会恢复。`)) return;
+  let restored = 0;
+  for (const id of ids) if (restoreDeletedQuestion(id, true)) restored += 1;
+  state.selectedRecycleIds.clear();
+  showToast(`已恢复 ${restored} 道题`);
 }
 
 function rebuildRecords(log, mastery = {}) {
@@ -1125,6 +1321,52 @@ function pageTitle(title, subtitle = "", actions = "") {
   `;
 }
 
+function globalDeleteButton(questionId, small = true) {
+  return `<button class="btn danger-outline ${small ? "small" : ""}" onclick="openGlobalDelete(${Number(questionId)})" title="从本设备公共题库及所有本地账号中删除">永久删除本题（全局生效）</button>`;
+}
+
+function renderQuestionSnapshot(question) {
+  if (!question) return "";
+  const options = Object.entries(question.options || {}).map(([letter, text]) => `<li><b>${esc(letter)}.</b> ${esc(text)}</li>`).join("");
+  return `
+    <div class="delete-question-preview">
+      <div class="question-meta">
+        <span class="badge ${DIFFICULTY_COLORS[question.difficultyLayer] || ""}">${esc(question.difficultyLayer)}</span>
+        <span class="badge brand">${esc(question.questionType)}</span>
+        <span class="badge">${esc(question.categoryKey)}</span>
+      </div>
+      <b>${esc(question.stem)}</b>
+      ${options ? `<ol class="snapshot-options">${options}</ol>` : ""}
+      <div class="muted">标准答案：${esc(answerText(question))}</div>
+    </div>`;
+}
+
+function renderDeleteModal() {
+  const question = q(state.deleteTargetId);
+  if (!question) return "";
+  return `
+    <div class="modal-backdrop" role="presentation" onclick="if(event.target===this) closeGlobalDelete()">
+      <section class="modal delete-modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+        <div class="modal-head">
+          <h3 id="delete-modal-title">永久删除本题</h3>
+          <button class="modal-close" onclick="closeGlobalDelete()" aria-label="关闭">×</button>
+        </div>
+        <div class="delete-warning"><b>⚠️ 全局删除警告！</b>删除后，该题目将从系统公共题库中永久移除，所有用户都将无法看到此题，且无法自动恢复。确定删除？</div>
+        <div class="delete-steps">
+          <b>第 1 步：核对题目</b>
+          ${renderQuestionSnapshot(question)}
+          <b>第 2 步：确认后果</b>
+          <label class="delete-ack"><input id="global-delete-ack" type="checkbox" onchange="document.getElementById('confirm-global-delete').disabled=!this.checked"> 我已阅读并确认全局删除后果</label>
+          <p class="muted">第 3 步点击删除后还会进行最后一次确认，并自动记录删除人、时间和题目完整快照。</p>
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" onclick="closeGlobalDelete()">取消</button>
+          <button id="confirm-global-delete" class="btn danger" disabled onclick="confirmGlobalDelete(${question.id})">确认永久删除</button>
+        </div>
+      </section>
+    </div>`;
+}
+
 function renderLayout(content) {
   const s = stats();
   return `
@@ -1141,6 +1383,7 @@ function renderLayout(content) {
       </aside>
       <main class="main">${content}</main>
       ${state.toast ? `<div class="toast">${esc(state.toast)}</div>` : ""}
+      ${renderDeleteModal()}
     </div>
   `;
 }
@@ -1167,6 +1410,10 @@ function renderDashboard() {
         ${weakRows(6).length ? weakRows(6).map((row) => `<div class="list-item"><b>${esc(row.path)}</b><br>正确率：${row.accuracy === null ? "-" : Math.round(row.accuracy * 100) + "%"} · 错题 ${row.wrong} · 完成 ${Math.round(row.completion * 100)}%</div>`).join("") : `<div class="empty">完成几题后会自动识别薄弱分类。</div>`}
       </section>
     </div>
+    <section class="panel" style="margin-top:14px">
+      <h3>薄弱题目</h3>
+      ${s.topWrong.length ? topWrongTable(s.topWrong.slice(0, 8)) : `<div class="empty">完成并答错题目后，这里会展示需要优先处理的薄弱题目。</div>`}
+    </section>
   `;
 }
 
@@ -1216,7 +1463,27 @@ function renderPractice() {
         <button class="btn primary" onclick="startRound()">开始本轮刷题</button>
       </section>
     </div>
+    ${renderFilteredQuestionPreview()}
   `;
+}
+
+function renderFilteredQuestionPreview() {
+  const items = filteredQuestions();
+  return `
+    <section class="panel" style="margin-top:14px">
+      <div class="section-heading"><div><h3>当前筛选题目预览</h3><span class="muted">展示前 ${Math.min(items.length, 12)} / ${items.length} 题</span></div></div>
+      ${items.length ? `<div class="list">${items.slice(0, 12).map((question) => `
+        <div class="list-item compact-question-item">
+          <div>
+            <div class="question-meta"><span class="badge ${DIFFICULTY_COLORS[question.difficultyLayer]}">${esc(question.difficultyLayer)}</span><span class="badge brand">${esc(question.questionType)}</span><span class="badge">${esc(question.categoryKey)}</span></div>
+            <b>${esc(compact(question.stem, 150))}</b>
+          </div>
+          <div class="inline-actions">
+            <button class="btn secondary small" onclick="startRound('hierarchy',[${question.id}])">打开原题</button>
+            ${globalDeleteButton(question.id)}
+          </div>
+        </div>`).join("")}</div>` : `<div class="empty">当前筛选下没有题目。</div>`}
+    </section>`;
 }
 
 function renderLadderStatus() {
@@ -1259,6 +1526,8 @@ function renderRound() {
           <button class="btn primary" onclick="submitAnswer(${question.id})">${ans.submitted && ans.dirty ? "重新提交" : ans.submitted && question.questionType !== "简答" ? "再次提交" : "提交答案"}</button>
           <button class="btn secondary" onclick="gotoQuestion(1)" ${index === total - 1 ? "disabled" : ""}>下一题</button>
           ${index === total - 1 ? `<button class="btn ghost" onclick="endRound()">完成本轮</button>` : ""}
+          <button class="btn ghost" onclick="skipCurrentQuestion()">本轮剔除本题</button>
+          ${globalDeleteButton(question.id, false)}
         </div>
       </article>
     </div>
@@ -1387,6 +1656,7 @@ function renderQuestionList(items, source = "wrong") {
         <button class="btn ghost small" onclick="toggleFavorite(${question.id})">${isFavorited(question.id) ? "★ 已收藏" : "☆ 收藏"}</button>
         <button class="btn ghost small" onclick="markMastered(${question.id}, ${!rec.mastered})">${rec.mastered ? "标记未掌握" : "标记已掌握"}</button>
         <button class="btn ghost small" onclick="state.noteEditorId=${question.id};render()">备注</button>
+        ${globalDeleteButton(question.id)}
       </div>
       ${state.noteEditorId === question.id ? renderNote(question.id) : ""}
       ${renderPublicNotes(question.id)}
@@ -1497,6 +1767,7 @@ function renderMyPublicNotes() {
               <button class="btn ghost small" onclick="toggleNotePublic(${note.questionId}, false)">关闭公开</button>
               <button class="btn secondary small" onclick="state.view='practice';startRound('hierarchy',[${note.questionId}])">打开原题</button>
               <button class="btn ghost small" onclick="state.noteEditorId=${note.questionId};state.view='practice';startRound('hierarchy',[${note.questionId}])">编辑备注</button>
+              ${globalDeleteButton(note.questionId)}
             </div>
           </div>
         </article>`;
@@ -1525,7 +1796,7 @@ function statsTable(rows) {
 }
 
 function topWrongTable(items) {
-  return `<table><thead><tr><th>题目</th><th>错次</th><th>操作</th></tr></thead><tbody>${items.map((question) => `<tr><td><span class="badge">${esc(question.difficultyLayer)}</span> <span class="badge">${esc(question.questionType)}</span><br>${esc(compact(question.stem, 90))}</td><td>${question.wrongCount}</td><td><button class="btn small secondary" onclick="startRound('wrong',[${question.id}])">再刷</button></td></tr>`).join("")}</tbody></table>`;
+  return `<div class="table-wrap"><table><thead><tr><th>题目</th><th>错次</th><th>操作</th></tr></thead><tbody>${items.map((question) => `<tr><td><span class="badge">${esc(question.difficultyLayer)}</span> <span class="badge">${esc(question.questionType)}</span><br>${esc(compact(question.stem, 90))}</td><td>${question.wrongCount}</td><td><div class="inline-actions"><button class="btn small secondary" onclick="startRound('wrong',[${question.id}])">再刷</button>${globalDeleteButton(question.id)}</div></td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function renderInsights() {
@@ -1565,9 +1836,57 @@ function batchInsightMarkdown() {
   return md;
 }
 
+function recycleTimeLeft(expiresAt) {
+  const ms = new Date(expiresAt).getTime() - Date.now();
+  if (ms <= 0) return "已过期";
+  const days = Math.floor(ms / (24 * 60 * 60 * 1000));
+  const hours = Math.ceil((ms % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
+  return `${days} 天 ${hours} 小时`;
+}
+
+function renderRecycleBin() {
+  const items = purgeExpiredRecycleBin();
+  const allSelected = items.length > 0 && items.every((item) => state.selectedRecycleIds.has(Number(item.questionId)));
+  return `
+    <section class="panel admin-wide">
+      <div class="section-heading">
+        <div><h3>已删除题目回收站</h3><p class="muted">普通用户全局删除的题目保留 30 天。恢复后题目重新进入公共题库，但已清理的个人作答历史不会恢复。</p></div>
+        <div class="inline-actions"><button class="btn secondary" onclick="batchRestoreDeletedQuestions()" ${state.selectedRecycleIds.size ? "" : "disabled"}>批量恢复（${state.selectedRecycleIds.size}）</button></div>
+      </div>
+      ${items.length ? `
+        <label class="select-all-row"><input type="checkbox" ${allSelected ? "checked" : ""} onchange="selectAllRecycle(this.checked)"> 全选当前 ${items.length} 道题</label>
+        <div class="recycle-list">${items.map((item) => `
+          <article class="recycle-item">
+            <input type="checkbox" ${state.selectedRecycleIds.has(Number(item.questionId)) ? "checked" : ""} onchange="toggleRecycleSelection(${Number(item.questionId)})">
+            <div>
+              <div class="question-meta"><span class="badge bad">题目 #${Number(item.questionId)}</span><span class="badge">剩余 ${recycleTimeLeft(item.expiresAt)}</span></div>
+              <b>${esc(compact(item.question.stem, 150))}</b>
+              <p class="muted">删除人：${esc(item.deletedByNickname || item.deletedBy)}（${esc(item.deletedBy)}） · 删除时间：${fmtTime(item.deletedAt)} · 到期时间：${fmtTime(item.expiresAt)}</p>
+              <details><summary>查看完整题目快照</summary>${renderQuestionSnapshot(item.question)}</details>
+              <button class="btn secondary small" onclick="restoreDeletedQuestion(${Number(item.questionId)})">恢复本题</button>
+            </div>
+          </article>`).join("")}</div>` : `<div class="empty">回收站为空。</div>`}
+    </section>`;
+}
+
+function renderDeleteLogs() {
+  const logs = deleteLogs();
+  return `
+    <section class="panel admin-wide">
+      <h3>全局删除操作日志</h3>
+      <p class="muted">日志保留操作人、时间与完整题目快照，用于追溯责任。当前显示最近 ${Math.min(logs.length, 100)} / ${logs.length} 条。</p>
+      ${logs.length ? `<div class="log-list">${logs.slice(0, 100).map((log) => `
+        <details class="log-item">
+          <summary><span class="badge ${log.action === "restore" ? "good" : "bad"}">${log.action === "restore" ? "恢复" : "删除"}</span> 题目 #${Number(log.questionId)} · ${esc(log.nickname || log.userId)}（${esc(log.userId)}） · ${fmtTime(log.at)} · ${esc(compact(log.question?.stem, 90))}</summary>
+          ${renderQuestionSnapshot(log.question)}
+        </details>`).join("")}</div>` : `<div class="empty">暂无删除操作日志。</div>`}
+    </section>`;
+}
+
 function renderAdmin() {
   if (state.user.role !== "super") return pageTitle("本地管理", "普通用户无题库管理权限") + `<div class="empty">只有管理员可以查看本页。</div>`;
-  return pageTitle("本地管理", "Excel 模板导入导出、题库备份、用户列表") + `
+  return pageTitle("本地管理", "Excel 模板导入导出、题库备份、回收站与删除审计") + `
+    <div class="hint local-scope-hint">当前是 GitHub Pages 静态版：“全局”指同一浏览器/设备中的公共题库与所有本地账号。跨设备实时同步需要启用后端数据库。</div>
     <div class="grid cols-2">
       <section class="panel">
         <h3>Excel 批量导入导出</h3>
@@ -1597,6 +1916,8 @@ function renderAdmin() {
         ${renderFilterPanel()}
       </section>
     </div>
+    ${renderRecycleBin()}
+    ${renderDeleteLogs()}
   `;
 }
 
@@ -1723,16 +2044,17 @@ function importExcelBank(input) {
       if (!rows) throw new Error("未找到符合模板字段的题目表");
       const errors = rows.flatMap((row, i) => validateImportedRow(row, i + 2));
       if (errors.length) throw new Error(errors.slice(0, 20).join("\n"));
-      const stems = new Set(BANK.map((question) => question.stem));
+      const sourceBank = loadBankSource();
+      const stems = new Set(sourceBank.map((question) => question.stem));
       const imported = [];
-      let nextId = Math.max(...BANK.map((question) => question.id)) + 1;
+      let nextId = Math.max(0, ...sourceBank.map((question) => question.id)) + 1;
       for (const row of rows) {
         const stem = String(row.题干 || "").trim();
         if (!stem || stems.has(stem)) continue;
         imported.push(normalizeImportedRow(row, nextId++));
         stems.add(stem);
       }
-      const merged = [...BANK, ...imported];
+      const merged = [...sourceBank, ...imported];
       writeJson(STORAGE.bankOverride, { questions: merged, importedAt: nowIso() });
       alert(`导入完成：新增 ${imported.length} 题，重复题干已自动跳过。页面将刷新。`);
       location.reload();
@@ -1798,6 +2120,8 @@ function render() {
 
 async function boot() {
   await ensureAdmin();
+  purgeExpiredRecycleBin();
+  reloadQuestionState();
   const session = readJson(STORAGE.session, null);
   if (session?.username && session.expiresAt > Date.now()) {
     const user = users().find((u) => u.username === session.username);
@@ -1809,5 +2133,16 @@ async function boot() {
   }
   render();
 }
+
+let storageRefreshTimer = null;
+window.addEventListener("storage", (event) => {
+  if (!event.key?.startsWith("llm_quiz_")) return;
+  clearTimeout(storageRefreshTimer);
+  storageRefreshTimer = setTimeout(() => {
+    reloadQuestionState();
+    if (state.user) syncRecords();
+    render();
+  }, 30);
+});
 
 document.addEventListener("DOMContentLoaded", boot);

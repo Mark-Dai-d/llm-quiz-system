@@ -28,6 +28,11 @@ for (const feature of [
   "renderMyPublicNotes",
   "batchClosePublicNotes",
   "batchDeletePublicNotes",
+  "globalDeleteQuestion",
+  "restoreDeletedQuestion",
+  "skipCurrentQuestion",
+  "renderRecycleBin",
+  "renderDeleteLogs",
 ]) {
   if (!appSource.includes(`function ${feature}`)) throw new Error(`Missing note feature: ${feature}`);
 }
