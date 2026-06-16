@@ -164,6 +164,20 @@ button:disabled {
   font-size: 14px;
 }
 
+.export-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 8px 10px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  font-size: 14px;
+  font-weight: 700;
+}
+
 input,
 select,
 textarea {

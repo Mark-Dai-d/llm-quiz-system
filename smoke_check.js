@@ -33,6 +33,10 @@ for (const feature of [
   "skipCurrentQuestion",
   "renderRecycleBin",
   "renderDeleteLogs",
+  "randomOptionOrder",
+  "optionOrderForQuestion",
+  "renderExportShuffleToggle",
+  "printWrongbookPdf",
 ]) {
   if (!appSource.includes(`function ${feature}`)) throw new Error(`Missing note feature: ${feature}`);
 }

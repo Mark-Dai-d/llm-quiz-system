@@ -22,6 +22,8 @@ const DIFFICULTY_COLORS = {
   冲刺层: "layer-sprint",
 };
 
+const DISPLAY_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+
 function esc(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -241,6 +243,7 @@ const state = {
   favoriteOnly: false,
   count: 10,
   customCount: "",
+  exportShuffleOptions: false,
   round: null,
   noteEditorId: null,
   expandedPublicNoteQuestions: new Set(),
@@ -330,6 +333,8 @@ function migrateLearningData(d) {
 
 function loadRound(username = state.user?.username) {
   state.round = readJson(STORAGE.round(username), null);
+  if (state.round) ensureRoundOptionOrders(state.round);
+  if (state.round && state.user?.username === username) saveRound();
 }
 
 function saveRound() {
@@ -382,6 +387,7 @@ function removeQuestionFromRound(round, questionId) {
   if (removedIndex < 0) return round;
   round.questionIds = round.questionIds.filter((item) => Number(item) !== id);
   delete round.answers?.[String(id)];
+  delete round.optionOrders?.[String(id)];
   if (!round.questionIds.length) return null;
   if (removedIndex < round.currentIndex) round.currentIndex -= 1;
   round.currentIndex = Math.max(0, Math.min(round.currentIndex, round.questionIds.length - 1));
@@ -574,15 +580,70 @@ function q(id) {
   return QMAP.get(Number(id));
 }
 
-function answerText(question) {
-  if (!question) return "";
-  if (question.questionType === "简答") return question.answerText || question.explanation || "参考答案见解析";
-  return (question.answerLetters || []).map((letter) => `${letter}. ${question.options?.[letter] || ""}`).join("；") || question.answerText;
+function optionLetters(question) {
+  return Object.keys(question?.options || {}).sort((a, b) => a.localeCompare(b));
 }
 
-function selectedText(question, selected) {
+function canShuffleOptions(question) {
+  return ["单选", "多选"].includes(question?.questionType) && optionLetters(question).length > 1;
+}
+
+function randomOptionOrder(question) {
+  const base = optionLetters(question);
+  if (!canShuffleOptions(question)) return base;
+  const order = shuffle(base);
+  if (order.join("|") === base.join("|")) order.push(order.shift());
+  return order;
+}
+
+function validOptionOrder(question, order) {
+  const base = optionLetters(question);
+  const current = Array.isArray(order) ? order.map(String) : [];
+  return current.length === base.length && base.every((letter) => current.includes(letter));
+}
+
+function ensureRoundOptionOrders(round = state.round) {
+  if (!round?.questionIds) return;
+  round.optionOrders ||= {};
+  for (const questionId of round.questionIds) {
+    const question = q(questionId);
+    if (!question) continue;
+    const key = String(question.id);
+    if (!validOptionOrder(question, round.optionOrders[key])) round.optionOrders[key] = randomOptionOrder(question);
+  }
+}
+
+function optionOrderForQuestion(questionId) {
+  const question = q(questionId);
+  if (!question) return [];
+  ensureRoundOptionOrders();
+  const order = state.round?.optionOrders?.[String(question.id)];
+  return validOptionOrder(question, order) ? order : optionLetters(question);
+}
+
+function displayLetter(index) {
+  return DISPLAY_LETTERS[index] || `选项${index + 1}`;
+}
+
+function answerText(question, optionOrder = null) {
+  if (!question) return "";
+  if (question.questionType === "简答") return question.answerText || question.explanation || "参考答案见解析";
+  const order = validOptionOrder(question, optionOrder) ? optionOrder : optionLetters(question);
+  return (question.answerLetters || []).map((letter) => {
+    const index = order.indexOf(letter);
+    const shown = index >= 0 ? displayLetter(index) : letter;
+    return `${shown}. ${question.options?.[letter] || ""}`;
+  }).join("；") || question.answerText;
+}
+
+function selectedText(question, selected, optionOrder = null) {
   if (question.questionType === "简答") return selected?.[0] || "";
-  return (selected || []).map((letter) => `${letter}. ${question.options?.[letter] || ""}`).join("；");
+  const order = validOptionOrder(question, optionOrder) ? optionOrder : optionLetters(question);
+  return (selected || []).map((letter) => {
+    const index = order.indexOf(letter);
+    const shown = index >= 0 ? displayLetter(index) : letter;
+    return `${shown}. ${question.options?.[letter] || ""}`;
+  }).join("；");
 }
 
 function isCorrect(question, selected) {
@@ -1043,12 +1104,16 @@ function startRound(mode = state.mode, explicitIds = null) {
   if (!Number.isInteger(count) || count < 1) return showError("请输入 ≥ 1 的正整数题量。");
   if (count > pool.length) return showError(`当前筛选总题量为 ${pool.length}，不可超出。`);
   if (mode !== "ladder") pool = shuffle(pool);
+  const selected = pool.slice(0, count);
+  const optionOrders = {};
+  for (const question of selected) optionOrders[String(question.id)] = randomOptionOrder(question);
   state.round = {
     id: randomId(),
     mode,
-    questionIds: pool.slice(0, count).map((question) => question.id),
+    questionIds: selected.map((question) => question.id),
     currentIndex: 0,
     answers: {},
+    optionOrders,
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
@@ -1156,7 +1221,7 @@ function generateInsight(questionId) {
     `【难度】${question.difficultyLayer}`,
     `【分类】${question.categoryKey}`,
     `【题型】${question.questionType}`,
-    `【标准答案】${answerText(question)}`,
+    `【标准答案】${answerText(question, optionOrderForQuestion(question.id))}`,
     `【背诵要点】${question.explanation || `围绕“${question.categoryKey}”记住题干关键词与标准答案。`}`,
   ].join("\n");
   saveRound();
@@ -1536,11 +1601,14 @@ function renderRound() {
 
 function renderOptions(question, ans) {
   const type = question.questionType === "多选" ? "checkbox" : "radio";
-  return `<div class="options">${Object.entries(question.options).map(([letter, text]) => {
+  const order = optionOrderForQuestion(question.id);
+  return `<div class="options">${order.map((letter, index) => {
+    const text = question.options?.[letter] || "";
+    const shown = displayLetter(index);
     const selected = ans.selected?.includes(letter);
     const show = ans.submitted && !ans.dirty;
     const cls = show && question.answerLetters.includes(letter) ? "correct" : show && selected ? "wrong" : "";
-    return `<label class="option ${cls}"><input type="${type}" name="q-${question.id}" ${selected ? "checked" : ""} onchange="selectOption(${question.id},'${letter}')"><span><b>${letter}.</b> ${esc(text)}</span></label>`;
+    return `<label class="option ${cls}"><input type="${type}" name="q-${question.id}" value="${esc(letter)}" ${selected ? "checked" : ""} onchange="selectOption(${question.id},'${letter}')"><span><b>${shown}.</b> ${esc(text)}</span></label>`;
   }).join("")}</div>`;
 }
 
@@ -1560,7 +1628,7 @@ function renderResult(question, ans) {
   if (!ans.submitted || ans.correct === undefined) return "";
   return `
     <div class="result-box ${ans.correct ? "success" : "danger-soft"}">
-      <b>${ans.correct ? "回答正确" : "回答错误"}</b><br>标准答案：${esc(answerText(question))}
+      <b>${ans.correct ? "回答正确" : "回答错误"}</b><br>标准答案：${esc(answerText(question, optionOrderForQuestion(question.id)))}
     </div>
     <div class="inline-actions" style="margin-top:12px">
       <button class="btn secondary" onclick="generateInsight(${question.id})">提炼本题考点</button>
@@ -1627,7 +1695,7 @@ function renderPublicNotes(questionId) {
 function renderWrongbook() {
   const wrongIds = new Set(stats().wrongItems.map((x) => x.id));
   const items = filteredQuestions().filter((question) => wrongIds.has(question.id)).map((question) => ({ ...question, ...stats().records[String(question.id)] }));
-  return pageTitle("错题本", "仅保留错题归档、手动掌握标记、筛选和导出，无自动复习提醒", `<button class="btn ghost" onclick="exportWrongbook()">导出 Word</button><button class="btn ghost" onclick="window.print()">打印/PDF</button>`) + `
+  return pageTitle("错题本", "仅保留错题归档、手动掌握标记、筛选和导出，无自动复习提醒", `${renderExportShuffleToggle()}<button class="btn ghost" onclick="exportWrongbook()">导出 Word</button><button class="btn ghost" onclick="printWrongbookPdf()">打印/PDF</button>`) + `
     <div class="split">
       ${renderFilterPanel()}
       <section class="panel">
@@ -1892,6 +1960,7 @@ function renderAdmin() {
         <h3>Excel 批量导入导出</h3>
         <p class="muted">仅识别模板字段：难度层级、知识分类、题型、题干、选项A-D、标准答案、解析。其他 sheet 会被忽略。</p>
         <div class="inline-actions">
+          ${renderExportShuffleToggle()}
           <a class="btn secondary" href="./题库导入模板.xlsx" download>下载导入模板</a>
           <label class="btn ghost">增量导入 Excel<input type="file" accept=".xlsx,.xls" style="display:none" onchange="importExcelBank(this)"></label>
           <button class="btn ghost" onclick="exportFilteredExcel()">导出当前筛选 Excel</button>
@@ -1931,30 +2000,70 @@ function downloadText(filename, content, type = "text/plain;charset=utf-8") {
   URL.revokeObjectURL(url);
 }
 
-function exportWrongbook() {
-  const rows = stats().wrongItems.map((rec) => ({ ...q(rec.id), ...rec }));
-  const htmlRows = rows.map((question) => `<tr><td>${esc(question.difficultyLayer)}</td><td>${esc(question.categoryKey)}</td><td>${esc(question.questionType)}</td><td>${esc(question.stem)}</td><td>${esc(answerText(question))}</td><td>${question.wrongCount}</td><td>${question.mastered ? "已掌握" : "未掌握"}</td><td>${esc(noteOf(question.id)?.text || "")}</td></tr>`).join("");
-  const html = `<html><head><meta charset="utf-8"><title>错题本</title></head><body><h1>个人错题本</h1><table border="1" cellspacing="0" cellpadding="6"><thead><tr><th>难度</th><th>知识分类</th><th>题型</th><th>题干</th><th>答案</th><th>错次</th><th>掌握状态</th><th>备注</th></tr></thead><tbody>${htmlRows}</tbody></table></body></html>`;
-  downloadText("个人错题本.doc", html, "application/msword;charset=utf-8");
+function renderExportShuffleToggle() {
+  return `<label class="export-toggle"><input type="checkbox" style="width:auto" ${state.exportShuffleOptions ? "checked" : ""} onchange="state.exportShuffleOptions=this.checked;render()"> 导出时打乱选项</label>`;
 }
 
-function rowsForExcel(items) {
-  return items.map((question) => ({
-    难度层级: question.difficultyLayer,
-    知识分类: question.categoryPath.join("/"),
-    题型: question.questionType,
-    题干: question.stem,
-    选项A: question.options.A || "",
-    选项B: question.options.B || "",
-    选项C: question.options.C || "",
-    选项D: question.options.D || "",
-    选项E: question.options.E || "",
-    选项F: question.options.F || "",
-    标准答案: question.questionType === "简答" ? question.answerText : question.answerLetters.join(""),
-    解析: question.explanation || "",
-    知识点标签: question.tags.join("、"),
-    "来源/依据": question.source || "",
-  }));
+function optionOrderForExport(question, shuffleOptions = state.exportShuffleOptions) {
+  return shuffleOptions ? randomOptionOrder(question) : optionLetters(question);
+}
+
+function optionColumnsForExport(question, order) {
+  const columns = {};
+  for (let index = 0; index < 6; index += 1) {
+    const sourceLetter = order[index];
+    columns[`选项${displayLetter(index)}`] = sourceLetter ? (question.options?.[sourceLetter] || "") : "";
+  }
+  return columns;
+}
+
+function answerLettersForExport(question, order) {
+  if (question.questionType === "简答") return question.answerText;
+  return (question.answerLetters || []).map((letter) => {
+    const index = order.indexOf(letter);
+    return index >= 0 ? displayLetter(index) : letter;
+  }).join("");
+}
+
+function wrongbookExportHtml() {
+  const rows = stats().wrongItems.map((rec) => ({ ...q(rec.id), ...rec })).filter((question) => question.id);
+  const htmlRows = rows.map((question) => {
+    const order = optionOrderForExport(question);
+    const options = order.map((letter, index) => `${displayLetter(index)}. ${esc(question.options?.[letter] || "")}`).join("<br>");
+    return `<tr><td>${esc(question.difficultyLayer)}</td><td>${esc(question.categoryKey)}</td><td>${esc(question.questionType)}</td><td>${esc(question.stem)}</td><td>${options}</td><td>${esc(answerText(question, order))}</td><td>${question.wrongCount}</td><td>${question.mastered ? "已掌握" : "未掌握"}</td><td>${esc(noteOf(question.id)?.text || "")}</td></tr>`;
+  }).join("");
+  return `<html><head><meta charset="utf-8"><title>错题本</title><style>body{font-family:"Microsoft YaHei",Arial,sans-serif}table{width:100%;border-collapse:collapse}td,th{border:1px solid #999;padding:6px;vertical-align:top;line-height:1.6}</style></head><body><h1>个人错题本</h1><p>选项顺序：${state.exportShuffleOptions ? "已随机打乱" : "题库原始顺序"}</p><table><thead><tr><th>难度</th><th>知识分类</th><th>题型</th><th>题干</th><th>选项</th><th>答案</th><th>错次</th><th>掌握状态</th><th>备注</th></tr></thead><tbody>${htmlRows}</tbody></table></body></html>`;
+}
+
+function exportWrongbook() {
+  downloadText("个人错题本.doc", wrongbookExportHtml(), "application/msword;charset=utf-8");
+}
+
+function printWrongbookPdf() {
+  const win = window.open("", "_blank");
+  if (!win) return showError("浏览器阻止了打印窗口，请允许弹窗后重试。");
+  win.document.open();
+  win.document.write(wrongbookExportHtml());
+  win.document.close();
+  win.focus();
+  setTimeout(() => win.print(), 200);
+}
+
+function rowsForExcel(items, shuffleOptions = state.exportShuffleOptions) {
+  return items.map((question) => {
+    const order = optionOrderForExport(question, shuffleOptions);
+    return {
+      难度层级: question.difficultyLayer,
+      知识分类: question.categoryPath.join("/"),
+      题型: question.questionType,
+      题干: question.stem,
+      ...optionColumnsForExport(question, order),
+      标准答案: answerLettersForExport(question, order),
+      解析: question.explanation || "",
+      知识点标签: question.tags.join("、"),
+      "来源/依据": question.source || "",
+    };
+  });
 }
 
 function exportExcel(filename, items) {
