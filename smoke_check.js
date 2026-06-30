@@ -17,7 +17,7 @@ if (bank.length !== banks.full.length) throw new Error("Legacy QUESTION_BANK sho
 const ids = new Set([...banks.full, ...banks.core].map((q) => q.id));
 if (ids.size !== banks.full.length + banks.core.length) throw new Error("Question IDs are not isolated across banks");
 
-const types = new Set(["??", "??", "??"]);
+const types = new Set(["单选", "多选", "判断"]);
 const layerBase = ["diff", "iculty"].join("");
 const removedLayerField = [layerBase, "Layer"].join("");
 for (const item of [...banks.full, ...banks.core]) {
@@ -25,7 +25,7 @@ for (const item of [...banks.full, ...banks.core]) {
   if (!types.has(item.questionType)) throw new Error("Invalid question type");
   if (!Array.isArray(item.categoryPath) || !item.categoryPath.length) throw new Error("Missing category path");
 }
-if (String(fs.readFileSync("app.js", "utf8")).match(/REVIEW_INTERVALS|nextReviewAt|reviewStage|????/)) {
+if (String(fs.readFileSync("app.js", "utf8")).match(/REVIEW_INTERVALS|nextReviewAt|reviewStage|今日复习/)) {
   throw new Error("Removed review scheduling terms still exist");
 }
 
@@ -37,8 +37,8 @@ const removedAppTerms = [
   ["render", "LayerCards"].join(""),
   ["render", "Es", "say"].join(""),
   ["grade", "Es", "say"].join(""),
-  ["?", "?"].join(""),
-  ["?", "??"].join(""),
+  ["简", "答"].join(""),
+  ["难", "度层"].join(""),
 ];
 if (removedAppTerms.some((term) => appSource.includes(term))) {
   throw new Error("Removed filter terms still exist in app.js");

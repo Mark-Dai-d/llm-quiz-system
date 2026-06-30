@@ -10,24 +10,24 @@ from openpyxl.utils import get_column_letter
 BANK_CONFIGS = [
     {
         "key": "full",
-        "label": "????",
-        "input": Path(r"C:\Users\14274\Downloads\??????_????.xlsx"),
+        "label": "全量题库",
+        "input": Path(r"C:\Users\14274\Downloads\毛概系统题库_合并终版.xlsx"),
         "id_offset": 200000,
         "expected": 786,
     },
     {
         "key": "core",
-        "label": "??????",
-        "input": Path(r"C:\Users\14274\Downloads\??????_???????.xlsx"),
+        "label": "核心重点题库",
+        "input": Path(r"C:\Users\14274\Downloads\毛概重点题库_章节题型整理版.xlsx"),
         "id_offset": 300000,
         "expected": 154,
     },
 ]
 
 OUTPUT_JS = Path(__file__).with_name("data.js")
-TEMPLATE_XLSX = Path(__file__).with_name("??????.xlsx")
+TEMPLATE_XLSX = Path(__file__).with_name("题库导入模板.xlsx")
 
-QUESTION_TYPES = ["??", "??", "??"]
+QUESTION_TYPES = ["单选", "多选", "判断"]
 OPTION_LETTERS = list("ABCDEF")
 
 
@@ -40,25 +40,25 @@ def clean(value):
 def split_path(value):
     text = clean(value)
     if not text:
-        return ["????"]
-    return [p.strip() for p in re.split(r"[/?>?\\|]+", text) if p.strip()] or ["????"]
+        return ["未分章节"]
+    return [p.strip() for p in re.split(r"[/／>＞\\|]+", text) if p.strip()] or ["未分章节"]
 
 
 def split_tags(value):
     text = clean(value)
     if not text:
         return []
-    return [p.strip() for p in re.split(r"[?,?;/?|]+", text) if p.strip()]
+    return [p.strip() for p in re.split(r"[、,，;/；|]+", text) if p.strip()]
 
 
 def normalize_type(value):
     text = clean(value)
-    if "??" in text:
-        return "??"
-    if "??" in text or "???" in text:
-        return "??"
-    if "??" in text or text:
-        return "??"
+    if "判断" in text:
+        return "判断"
+    if "多选" in text or "不定项" in text:
+        return "多选"
+    if "单选" in text or text:
+        return "单选"
     return ""
 
 
@@ -66,15 +66,15 @@ def strip_option_prefix(value, letter):
     text = clean(value)
     if not text:
         return ""
-    return re.sub(rf"^{letter}\s*[\.??:?]\s*", "", text, flags=re.I)
+    return re.sub(rf"^{letter}\s*[\.．、:：]\s*", "", text, flags=re.I)
 
 
 def answer_letters(answer, qtype):
     text = clean(answer).upper()
-    if qtype == "??":
-        if text in {"A", "TRUE"} or "?" in text or "??" in text:
+    if qtype == "判断":
+        if text in {"A", "TRUE"} or "对" in text or "正确" in text:
             return ["A"]
-        if text in {"B", "FALSE"} or "?" in text or "??" in text:
+        if text in {"B", "FALSE"} or "错" in text or "错误" in text:
             return ["B"]
     letters = re.findall(r"[A-F]", text)
     seen = []
@@ -90,49 +90,49 @@ def row_dict(ws, row):
 
 
 def find_question_sheet(wb):
-    required = {"??", "??", "??", "A", "B", "C", "D", "????"}
+    required = {"章节", "题型", "题干", "A", "B", "C", "D", "正确答案"}
     for ws in wb.worksheets:
         headers = {clean(ws.cell(1, c).value) for c in range(1, ws.max_column + 1)}
         if required.issubset(headers):
             return ws
-    raise ValueError("?????????????")
+    raise ValueError("未找到包含题库字段的工作表")
 
 
 def validate_question(q, row_no, bank_label):
     errors = []
     if not q["categoryPath"]:
-        errors.append(f"{bank_label} ?{row_no}???????")
+        errors.append(f"{bank_label} 第{row_no}行章节不能为空")
     if q["questionType"] not in QUESTION_TYPES:
-        errors.append(f"{bank_label} ?{row_no}???????")
+        errors.append(f"{bank_label} 第{row_no}行题型填写错误")
     if not q["stem"]:
-        errors.append(f"{bank_label} ?{row_no}???????")
-    if q["questionType"] in {"??", "??"}:
+        errors.append(f"{bank_label} 第{row_no}行题干不能为空")
+    if q["questionType"] in {"单选", "多选"}:
         for letter in "ABCD":
             if not q["options"].get(letter):
-                errors.append(f"{bank_label} ?{row_no}???{letter}????")
+                errors.append(f"{bank_label} 第{row_no}行选项{letter}不能为空")
         if not q["answerLetters"]:
-            errors.append(f"{bank_label} ?{row_no}????????????")
-    if q["questionType"] == "??" and not q["answerLetters"]:
-        errors.append(f"{bank_label} ?{row_no}?????????????/????/?")
+            errors.append(f"{bank_label} 第{row_no}行正确答案应填写选项字母")
+    if q["questionType"] == "判断" and not q["answerLetters"]:
+        errors.append(f"{bank_label} 第{row_no}行判断题正确答案应填写正确/错误或对/错")
     return errors
 
 
 def normalize_row(raw, row_index, bank_key, bank_label, id_offset):
-    qtype = normalize_type(raw.get("??"))
-    chapter = split_path(raw.get("??"))
-    answer = clean(raw.get("????"))
+    qtype = normalize_type(raw.get("题型"))
+    chapter = split_path(raw.get("章节"))
+    answer = clean(raw.get("正确答案"))
     options = {}
     for i, letter in enumerate(OPTION_LETTERS):
-        value = raw.get(letter) if letter in raw else raw.get(f"??{letter}")
+        value = raw.get(letter) if letter in raw else raw.get(f"选项{letter}")
         value = strip_option_prefix(value, letter)
         if value:
             options[letter] = value
-    if qtype == "??":
+    if qtype == "判断":
         options = {
-            "A": options.get("A") or "??",
-            "B": options.get("B") or "??",
+            "A": options.get("A") or "正确",
+            "B": options.get("B") or "错误",
         }
-    source_id = clean(raw.get("??")) or f"{bank_key.upper()}{row_index:03d}"
+    source_id = clean(raw.get("题号")) or f"{bank_key.upper()}{row_index:03d}"
     return {
         "id": id_offset + row_index,
         "sourceId": source_id,
@@ -141,13 +141,13 @@ def normalize_row(raw, row_index, bank_key, bank_label, id_offset):
         "categoryPath": chapter,
         "categoryKey": " / ".join(chapter),
         "questionType": qtype,
-        "stem": clean(raw.get("??")),
+        "stem": clean(raw.get("题干")),
         "options": options,
         "answerLetters": answer_letters(answer, qtype),
         "answerText": answer,
-        "explanation": clean(raw.get("??")),
-        "tags": split_tags(raw.get("?????") or raw.get("?????")),
-        "source": clean(raw.get("??/??")),
+        "explanation": clean(raw.get("解析")),
+        "tags": split_tags(raw.get("易错点标签") or raw.get("知识点标签")),
+        "source": clean(raw.get("来源/依据")),
         "autoScore": True,
     }
 
@@ -170,7 +170,7 @@ def load_bank(config):
     if errors:
         raise ValueError("\n".join(errors[:80]))
     if config.get("expected") and len(questions) != config["expected"]:
-        raise ValueError(f"{config['label']} ???? {config['expected']}???? {len(questions)}")
+        raise ValueError(f"{config['label']} 题量应为 {config['expected']}，实际为 {len(questions)}")
     return questions
 
 
@@ -187,7 +187,7 @@ def build_meta(banks):
         for cfg in BANK_CONFIGS
     ]
     meta = {
-        "title": "????????????????????????",
+        "title": "毛泽东思想和中国特色社会主义理论体系概论刷题系统",
         "questionCount": sum(len(items) for items in banks.values()),
         "defaultBankScope": "full",
         "bankScopes": bank_scopes,
@@ -219,7 +219,7 @@ def write_data_js(banks):
         f"window.QUESTION_BANKS = {json.dumps(banks, ensure_ascii=False)};",
         "window.QUESTION_BANK = window.QUESTION_BANKS.full;",
         f"window.QUESTION_META = {json.dumps(meta, ensure_ascii=False)};",
-        "window.QUESTION_SCHEMA = {questionTypes:['??','??','??']};",
+        "window.QUESTION_SCHEMA = {questionTypes:['单选','多选','判断']};",
         "",
     ]
     OUTPUT_JS.write_text("\n".join(chunks), encoding="utf-8")
@@ -228,13 +228,13 @@ def write_data_js(banks):
 def write_template():
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "??????"
-    headers = ["??", "??", "??", "A", "B", "C", "D", "????", "??", "?????"]
+    ws.title = "题目导入模板"
+    headers = ["章节", "题型", "题干", "A", "B", "C", "D", "正确答案", "解析", "易错点标签"]
     ws.append(headers)
     samples = [
-        ["?? ???????????", "??", "????????????????????????? ??", "?????", "?????", "??????????", "?????", "A", "????????????????????????????", "?????"],
-        ["??? ???????????", "??", "???????????? ??", "????", "????", "????", "????", "ABC", "?????????????????????????", "????"],
-        ["??? ?????????", "??", "????????????????????????????", "??", "??", "", "", "??", "?????????????????", "????"],
+        ["导论 马克思主义中国化时代化", "单选", "马克思主义中国化第一次历史性飞跃产生的理论成果是（ ）。", "毛泽东思想", "邓小平理论", "“三个代表”重要思想", "科学发展观", "A", "毛泽东思想是马克思主义中国化第一次历史性飞跃的理论成果。", "第一次飞跃"],
+        ["第一章 毛泽东思想及其历史地位", "多选", "毛泽东思想活的灵魂包括（ ）。", "实事求是", "群众路线", "独立自主", "依法治国", "ABC", "实事求是、群众路线、独立自主是毛泽东思想活的灵魂。", "活的灵魂"],
+        ["第二章 新民主主义革命理论", "判断", "新民主主义革命是无产阶级领导的人民大众的反帝反封建革命。", "正确", "错误", "", "", "正确", "新民主主义革命领导阶级是无产阶级。", "革命性质"],
     ]
     for row in samples:
         ws.append(row)
@@ -247,16 +247,16 @@ def write_template():
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.freeze_panes = "A2"
 
-    guide = wb.create_sheet("????")
-    guide.append(["??", "????", "????"])
+    guide = wb.create_sheet("填写规范")
+    guide.append(["字段", "是否必填", "填写规范"])
     guide_rows = [
-        ["??", "?", "??????? / ?????????????/???"],
-        ["??", "?", "?????????????"],
-        ["??", "?", "????"],
-        ["A-D", "??/????", "?????? ??/??"],
-        ["????", "?", "??? A/B/C/D???? ABC/ABD???? ??/?? ? ?/?"],
-        ["??", "?", "?????????"],
-        ["?????", "?", "?? ? ? , ??????"],
+        ["章节", "是", "章节名称，可用 / 分隔多级分类，例如：第一章/第一节"],
+        ["题型", "是", "只能填写：单选、多选、判断"],
+        ["题干", "是", "题目正文"],
+        ["A-D", "单选/多选必填", "判断题可填写 正确/错误"],
+        ["正确答案", "是", "单选填 A/B/C/D；多选填 ABC/ABD；判断填 正确/错误 或 对/错"],
+        ["解析", "否", "题目解析或背诵要点"],
+        ["易错点标签", "否", "可用 、 或 , 分隔多个标签"],
     ]
     for row in guide_rows:
         guide.append(row)
