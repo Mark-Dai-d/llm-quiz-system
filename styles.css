@@ -237,6 +237,27 @@ textarea {
   font-size: 13px;
 }
 
+.sidebar-scope {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+}
+
+.sidebar-scope button {
+  width: 100%;
+  min-height: 34px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  color: #dbeafe;
+  background: rgba(255, 255, 255, 0.08);
+  text-align: left;
+}
+
+.sidebar-scope button.active {
+  color: #0c3157;
+  background: #fff;
+}
+
 .nav {
   display: grid;
   gap: 6px;
@@ -367,6 +388,7 @@ textarea {
   margin-bottom: 16px;
 }
 
+.bank-scope-row,
 .difficulty-row,
 .type-row {
   display: flex;
@@ -374,6 +396,7 @@ textarea {
   gap: 8px;
 }
 
+.bank-scope-pill,
 .difficulty-pill,
 .check-chip {
   display: inline-flex;
@@ -387,6 +410,7 @@ textarea {
   color: var(--ink);
 }
 
+.bank-scope-pill span,
 .difficulty-pill span {
   padding: 1px 7px;
   border-radius: 999px;
@@ -395,6 +419,7 @@ textarea {
   font-size: 12px;
 }
 
+.bank-scope-pill.active,
 .difficulty-pill.active,
 .check-chip:has(input:checked) {
   border-color: var(--brand);

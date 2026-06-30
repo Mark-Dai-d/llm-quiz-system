@@ -3,17 +3,23 @@ const SCHEMA = window.QUESTION_SCHEMA || {
   difficultyLayers: ["基础层", "进阶层", "冲刺层"],
   questionTypes: ["单选", "多选", "判断", "简答"],
 };
+const BANK_SCOPE_CONFIGS = META.bankScopes || [
+  { key: "full", label: "全量题库", count: (window.QUESTION_BANK || []).length },
+];
+const DEFAULT_BANK_SCOPE = META.defaultBankScope || BANK_SCOPE_CONFIGS[0]?.key || "full";
+let activeBankScope = DEFAULT_BANK_SCOPE;
 
 const STORAGE = {
   users: "llm_quiz_users_v2",
   session: "llm_quiz_session_v2",
+  bankScope: (username = "guest") => `llm_quiz_bank_scope_v1_${username}`,
   bankOverride: "llm_quiz_bank_override_v2",
   publicNotes: "llm_quiz_public_notes_v1",
   deletedQuestionIds: "llm_quiz_deleted_question_ids_v1",
   questionRecycleBin: "llm_quiz_question_recycle_bin_v1",
   questionDeleteLogs: "llm_quiz_question_delete_logs_v1",
   data: (username) => `llm_quiz_learning_v2_${username}`,
-  round: (username) => `llm_quiz_round_v2_${username}`,
+  round: (username, scope = activeBankScope) => `llm_quiz_round_v2_${normalizeBankScope(scope)}_${username}`,
 };
 
 const DIFFICULTY_COLORS = {
@@ -108,6 +114,24 @@ function writeJson(key, value) {
   localStorage.setItem(key, JSON.stringify(value));
 }
 
+function bankScopeKeys() {
+  return BANK_SCOPE_CONFIGS.map((item) => item.key);
+}
+
+function normalizeBankScope(scope) {
+  return bankScopeKeys().includes(scope) ? scope : DEFAULT_BANK_SCOPE;
+}
+
+function bankScopeLabel(scope = activeBankScope) {
+  return BANK_SCOPE_CONFIGS.find((item) => item.key === scope)?.label || scope;
+}
+
+function savedBankScope(username = state?.user?.username || "guest") {
+  return normalizeBankScope(readJson(STORAGE.bankScope(username), DEFAULT_BANK_SCOPE));
+}
+
+activeBankScope = savedBankScope("guest");
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -139,7 +163,7 @@ function randomId() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function normalizeQuestion(q, index) {
+function normalizeQuestion(q, index, scope = activeBankScope) {
   const difficultyLayer = q.difficultyLayer || q.layer || "基础层";
   const categoryPath = Array.isArray(q.categoryPath) && q.categoryPath.length
     ? q.categoryPath
@@ -150,6 +174,8 @@ function normalizeQuestion(q, index) {
   return {
     ...q,
     id: Number(q.id) || index + 1,
+    bankScope: q.bankScope || scope,
+    bankLabel: q.bankLabel || bankScopeLabel(q.bankScope || scope),
     difficultyLayer,
     categoryPath,
     categoryKey: q.categoryKey || categoryPath.join(" / "),
@@ -169,13 +195,23 @@ function deletedQuestionIds() {
 
 function loadBankSource() {
   const override = readJson(STORAGE.bankOverride, null);
-  const source = override?.questions?.length ? override.questions : (window.QUESTION_BANK || []);
-  return source.map(normalizeQuestion);
+  const scope = activeBankScope;
+  const source = override?.banks?.[scope]?.length
+    ? override.banks[scope]
+    : window.QUESTION_BANKS?.[scope] || (scope === DEFAULT_BANK_SCOPE ? (window.QUESTION_BANK || []) : []);
+  return source.map((question, index) => normalizeQuestion(question, index, scope));
 }
 
 function loadBank() {
   const deletedIds = deletedQuestionIds();
   return loadBankSource().filter((question) => !deletedIds.has(question.id));
+}
+
+function saveBankOverrideForScope(scope, questions) {
+  const override = readJson(STORAGE.bankOverride, {}) || {};
+  const banks = { ...(override.banks || {}) };
+  banks[normalizeBankScope(scope)] = questions;
+  writeJson(STORAGE.bankOverride, { ...override, banks, importedAt: nowIso() });
 }
 
 let BANK = loadBank();
@@ -233,6 +269,7 @@ const state = {
   authTab: "login",
   error: "",
   toast: "",
+  selectedBankScope: activeBankScope,
   selectedDifficulty: "全部难度",
   selectedTypes: new Set(SCHEMA.questionTypes),
   selectedCategoryIds: new Set(["all"]),
@@ -331,8 +368,8 @@ function migrateLearningData(d) {
   return d;
 }
 
-function loadRound(username = state.user?.username) {
-  state.round = readJson(STORAGE.round(username), null);
+function loadRound(username = state.user?.username, scope = activeBankScope) {
+  state.round = readJson(STORAGE.round(username, scope), null);
   if (state.round) ensureRoundOptionOrders(state.round);
   if (state.round && state.user?.username === username) saveRound();
 }
@@ -406,10 +443,12 @@ function removeQuestionFromUserData(username, questionId) {
   d.records = rebuildRecords(d.answerLog, d.mastery);
   saveData(d, username);
 
-  const roundKey = STORAGE.round(username);
-  const cleanedRound = removeQuestionFromRound(readJson(roundKey, null), id);
-  if (cleanedRound) writeJson(roundKey, cleanedRound);
-  else localStorage.removeItem(roundKey);
+  for (const scope of bankScopeKeys()) {
+    const roundKey = STORAGE.round(username, scope);
+    const cleanedRound = removeQuestionFromRound(readJson(roundKey, null), id);
+    if (cleanedRound) writeJson(roundKey, cleanedRound);
+    else localStorage.removeItem(roundKey);
+  }
 }
 
 function reloadQuestionState() {
@@ -501,10 +540,14 @@ function restoreDeletedQuestion(questionId, silent = false) {
   const bin = purgeExpiredRecycleBin();
   const item = bin.find((entry) => Number(entry.questionId) === id);
   if (!item) return silent ? false : showError("该题目已超过 30 天保留期或不存在。");
+  const restoreScope = normalizeBankScope(item.question?.bankScope || activeBankScope);
+  const previousScope = activeBankScope;
+  activeBankScope = restoreScope;
   const sourceBank = loadBankSource();
   if (!sourceBank.some((question) => question.id === id)) {
-    writeJson(STORAGE.bankOverride, { questions: [...sourceBank, item.question], restoredAt: nowIso() });
+    saveBankOverrideForScope(restoreScope, [...sourceBank, item.question]);
   }
+  activeBankScope = previousScope;
   const ids = deletedQuestionIds();
   ids.delete(id);
   writeJson(STORAGE.deletedQuestionIds, [...ids].sort((a, b) => a - b));
@@ -654,6 +697,28 @@ function isCorrect(question, selected) {
 
 function currentRoot() {
   return CATEGORY_TREES[state.selectedDifficulty] || CATEGORY_TREES["全部难度"];
+}
+
+function resetCategorySelection() {
+  state.selectedDifficulty = "全部难度";
+  state.selectedCategoryIds = new Set(["all"]);
+  state.expandedCategoryIds = new Set(Object.values(CATEGORY_TREES).map((n) => n.id));
+}
+
+function setBankScope(scope) {
+  const next = normalizeBankScope(scope);
+  if (next === activeBankScope) return;
+  saveRound();
+  activeBankScope = next;
+  state.selectedBankScope = next;
+  if (state.user) writeJson(STORAGE.bankScope(state.user.username), next);
+  else writeJson(STORAGE.bankScope("guest"), next);
+  BANK = loadBank();
+  indexBank();
+  resetCategorySelection();
+  if (state.user) loadRound(state.user.username, next);
+  clearError();
+  render();
 }
 
 function setDifficulty(layer) {
@@ -952,7 +1017,7 @@ function stats() {
   const d = data();
   d.records = rebuildRecords(d.answerLog, d.mastery);
   const records = d.records;
-  const recordItems = Object.entries(records).map(([id, rec]) => ({ id: Number(id), ...rec }));
+  const recordItems = Object.entries(records).map(([id, rec]) => ({ id: Number(id), ...rec })).filter((rec) => q(rec.id));
   const attempts = recordItems.reduce((sum, rec) => sum + rec.attempts, 0);
   const correct = recordItems.reduce((sum, rec) => sum + rec.correctCount, 0);
   const wrongItems = recordItems.filter((rec) => rec.wrongCount > 0);
@@ -1271,6 +1336,11 @@ async function login() {
   if ((await sha256(`${user.salt}:${password}`)) !== user.hash) return showError("密码错误。");
   state.user = { username: user.username, role: user.role || (user.username === "admin" ? "super" : "user") };
   writeJson(STORAGE.session, { username, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+  activeBankScope = savedBankScope(username);
+  state.selectedBankScope = activeBankScope;
+  BANK = loadBank();
+  indexBank();
+  resetCategorySelection();
   loadRound(username);
   syncRecords();
   clearError();
@@ -1327,6 +1397,15 @@ function renderFilterPanel() {
     <section class="panel filter-panel">
       <h3>筛选题库</h3>
       <div class="filter-block">
+        <b>0. 题库范围</b>
+        <div class="bank-scope-row">
+          ${BANK_SCOPE_CONFIGS.map((scope) => {
+            const count = META.banks?.[scope.key]?.questionCount ?? scope.count ?? 0;
+            return `<button class="bank-scope-pill ${state.selectedBankScope === scope.key ? "active" : ""}" onclick="setBankScope('${scope.key}')">${esc(scope.label)} <span>${count}题</span></button>`;
+          }).join("")}
+        </div>
+      </div>
+      <div class="filter-block">
         <b>1. 难度层级</b>
         <div class="difficulty-row">
           <button class="difficulty-pill ${state.selectedDifficulty === "全部难度" ? "active" : ""}" onclick="setDifficulty('全部难度')">全部难度 <span>${BANK.length}</span></button>
@@ -1353,8 +1432,8 @@ function renderAuth() {
     <div class="auth-shell">
       <div class="auth-card">
         <section class="auth-copy">
-          <h1>大模型省赛刷题系统</h1>
-          <p>已重构为“基础层 / 进阶层 / 冲刺层 + 知识分类”的双层级题库体系，明确区分单选、多选、判断、简答。</p>
+          <h1>毛概刷题系统</h1>
+          <p>已接入全量题库与核心重点题库，按章节、题型和知识分类组织，明确区分单选、多选、判断、简答。</p>
           <ul>
             <li>错题只做归档和手动掌握标记，不再包含任何自动复习排期。</li>
             <li>默认管理员：admin / admin123。</li>
@@ -1437,7 +1516,10 @@ function renderLayout(content) {
   return `
     <div class="app-shell">
       <aside class="sidebar">
-        <div class="brand"><b>省赛刷题系统</b><span>${BANK.length} 题 · 双层级题库</span></div>
+        <div class="brand"><b>毛概刷题系统</b><span>${bankScopeLabel()} · ${BANK.length} 题</span></div>
+        <div class="sidebar-scope">
+          ${BANK_SCOPE_CONFIGS.map((scope) => `<button class="${state.selectedBankScope === scope.key ? "active" : ""}" onclick="setBankScope('${scope.key}')">${esc(scope.label)}</button>`).join("")}
+        </div>
         <nav class="nav">
           ${nav.map(([id, label]) => `<button class="${state.view === id ? "active" : ""}" onclick="setView('${id}')">${label}${id === "wrongbook" && s.wrongCount ? ` · ${s.wrongCount}` : ""}</button>`).join("")}
         </nav>
@@ -1459,7 +1541,7 @@ function metric(label, value, suffix = "") {
 
 function renderDashboard() {
   const s = stats();
-  return pageTitle("首页", "难度分层进度、错题概览和薄弱分类") + `
+  return pageTitle("首页", `${bankScopeLabel()} · 难度分层进度、错题概览和薄弱分类`) + `
     <div class="grid cols-3">
       ${metric("累计作答", s.attempts, "次")}
       ${metric("总正确率", Math.round(s.accuracy * 100), "%")}
@@ -1496,7 +1578,7 @@ function renderLayerCards(rows) {
 function renderPractice() {
   if (state.round) return renderRound();
   const pool = poolForMode();
-  return pageTitle("刷题训练", "所有模式均绑定难度层级、题型和知识分类筛选") + `
+  return pageTitle("刷题训练", `${bankScopeLabel()} · 所有模式均绑定难度层级、题型和知识分类筛选`) + `
     <div class="split">
       ${renderFilterPanel()}
       <section class="panel">
@@ -1524,7 +1606,7 @@ function renderPractice() {
             <button class="btn ghost" onclick="setAllCount()">全部题目</button>
           </div>
         </div>
-        <p class="muted">当前模式可出题：${pool.length} 题；本轮将抽取：${Math.min(currentCount(pool), pool.length || currentCount(pool))} 题。</p>
+        <p class="muted">当前题库范围：${bankScopeLabel()}；当前模式可出题：${pool.length} 题；本轮将抽取：${Math.min(currentCount(pool), pool.length || currentCount(pool))} 题。</p>
         <button class="btn primary" onclick="startRound()">开始本轮刷题</button>
       </section>
     </div>
@@ -1695,7 +1777,7 @@ function renderPublicNotes(questionId) {
 function renderWrongbook() {
   const wrongIds = new Set(stats().wrongItems.map((x) => x.id));
   const items = filteredQuestions().filter((question) => wrongIds.has(question.id)).map((question) => ({ ...question, ...stats().records[String(question.id)] }));
-  return pageTitle("错题本", "仅保留错题归档、手动掌握标记、筛选和导出，无自动复习提醒", `${renderExportShuffleToggle()}<button class="btn ghost" onclick="exportWrongbook()">导出 Word</button><button class="btn ghost" onclick="printWrongbookPdf()">打印/PDF</button>`) + `
+  return pageTitle("错题本", `${bankScopeLabel()} · 仅保留错题归档、手动掌握标记、筛选和导出，无自动复习提醒`, `${renderExportShuffleToggle()}<button class="btn ghost" onclick="exportWrongbook()">导出 Word</button><button class="btn ghost" onclick="printWrongbookPdf()">打印/PDF</button>`) + `
     <div class="split">
       ${renderFilterPanel()}
       <section class="panel">
@@ -1735,7 +1817,7 @@ function renderQuestionList(items, source = "wrong") {
 function renderFavorites() {
   const fav = favoriteSet();
   const items = BANK.filter((question) => fav.has(question.id)).sort((a, b) => a.difficultyLayer.localeCompare(b.difficultyLayer, "zh-CN") || a.categoryKey.localeCompare(b.categoryKey, "zh-CN"));
-  return pageTitle("我的收藏", "收藏与备注互不覆盖，可集中复盘重点题", `<button class="btn primary" onclick="startRound('favorite',[...favoriteSet()])">刷收藏题</button><button class="btn danger" onclick="clearFavorites()">批量取消收藏</button>`) + (items.length ? renderGroupedQuestions(items) : `<div class="empty">还没有收藏题目。</div>`);
+  return pageTitle("我的收藏", `${bankScopeLabel()} · 收藏与备注互不覆盖，可集中复盘重点题`, `<button class="btn primary" onclick="startRound('favorite',[...favoriteSet()])">刷收藏题</button><button class="btn danger" onclick="clearFavorites()">批量取消收藏</button>`) + (items.length ? renderGroupedQuestions(items) : `<div class="empty">当前题库范围还没有收藏题目。</div>`);
 }
 
 function renderGroupedQuestions(items) {
@@ -1749,9 +1831,10 @@ function renderGroupedQuestions(items) {
 }
 
 function clearFavorites() {
-  if (!confirm("确认取消全部收藏？备注不会删除。")) return;
+  if (!confirm(`确认取消${bankScopeLabel()}中的全部收藏？备注不会删除。`)) return;
   const d = data();
-  d.favorites = [];
+  const currentIds = new Set(BANK.map((question) => question.id));
+  d.favorites = favoriteItems(d).filter((item) => !currentIds.has(item.questionId));
   saveData(d);
   render();
 }
@@ -1761,6 +1844,7 @@ function myPublicNotes() {
   return Object.entries(d.notes || {})
     .map(([questionId, raw]) => normalizeNote(raw, questionId, state.user.username))
     .filter((note) => note?.isPublic && note.author === state.user.username)
+    .filter((note) => q(note.questionId))
     .sort((a, b) => new Date(b.updateTime) - new Date(a.updateTime));
 }
 
@@ -1811,7 +1895,7 @@ function batchDeletePublicNotes() {
 function renderMyPublicNotes() {
   const notes = myPublicNotes();
   const allSelected = notes.length > 0 && notes.every((note) => state.selectedPublicNoteIds.has(note.questionId));
-  return pageTitle("我的公开备注", "集中管理自己发布的公开备注，其他用户始终只有只读权限", `
+  return pageTitle("我的公开备注", `${bankScopeLabel()} · 集中管理自己发布的公开备注，其他用户始终只有只读权限`, `
     <button class="btn ghost" onclick="batchClosePublicNotes()">批量关闭公开</button>
     <button class="btn danger" onclick="batchDeletePublicNotes()">批量删除</button>`) + `
     <section class="panel">
@@ -1845,7 +1929,7 @@ function renderMyPublicNotes() {
 
 function renderStats() {
   const s = stats();
-  return pageTitle("学习统计", "全局统计、难度层热力图、知识分类穿透和高频错题") + `
+  return pageTitle("学习统计", `${bankScopeLabel()} · 全局统计、难度层热力图、知识分类穿透和高频错题`) + `
     <div class="grid cols-3">
       ${metric("已覆盖题目", s.answered, `/${BANK.length}`)}
       ${metric("手动已掌握", s.masteredCount, "题")}
@@ -1869,7 +1953,7 @@ function topWrongTable(items) {
 
 function renderInsights() {
   const md = batchInsightMarkdown();
-  return pageTitle("考点提炼", "按当前筛选或错题本生成分层级背诵提纲", `<button class="btn ghost" onclick="downloadText('分层级背诵提纲.md', batchInsightMarkdown(), 'text/markdown;charset=utf-8')">导出 Markdown</button>`) + `
+  return pageTitle("考点提炼", `${bankScopeLabel()} · 按当前筛选或错题本生成分层级背诵提纲`, `<button class="btn ghost" onclick="downloadText('分层级背诵提纲.md', batchInsightMarkdown(), 'text/markdown;charset=utf-8')">导出 Markdown</button>`) + `
     <div class="split">
       <section class="panel">
         <h3>提炼范围</h3>
@@ -1958,13 +2042,13 @@ function renderAdmin() {
     <div class="grid cols-2">
       <section class="panel">
         <h3>Excel 批量导入导出</h3>
-        <p class="muted">仅识别模板字段：难度层级、知识分类、题型、题干、选项A-D、标准答案、解析。其他 sheet 会被忽略。</p>
+        <p class="muted">仅识别模板字段：章节、题型、题干、A-D、正确答案、解析、易错点标签。增量导入会写入当前题库范围：${bankScopeLabel()}。</p>
         <div class="inline-actions">
           ${renderExportShuffleToggle()}
           <a class="btn secondary" href="./题库导入模板.xlsx" download>下载导入模板</a>
           <label class="btn ghost">增量导入 Excel<input type="file" accept=".xlsx,.xls" style="display:none" onchange="importExcelBank(this)"></label>
           <button class="btn ghost" onclick="exportFilteredExcel()">导出当前筛选 Excel</button>
-          <button class="btn ghost" onclick="exportAllExcel()">导出全库 Excel</button>
+          <button class="btn ghost" onclick="exportAllExcel()">导出当前范围全部 Excel</button>
         </div>
         ${!window.XLSX ? `<div class="hint">Excel 导入导出需要在线加载 XLSX 解析器；若网络不可用，可运行本地 generate_data.py 生成 data.js。</div>` : ""}
       </section>
@@ -2010,9 +2094,9 @@ function optionOrderForExport(question, shuffleOptions = state.exportShuffleOpti
 
 function optionColumnsForExport(question, order) {
   const columns = {};
-  for (let index = 0; index < 6; index += 1) {
+  for (let index = 0; index < 4; index += 1) {
     const sourceLetter = order[index];
-    columns[`选项${displayLetter(index)}`] = sourceLetter ? (question.options?.[sourceLetter] || "") : "";
+    columns[displayLetter(index)] = sourceLetter ? (question.options?.[sourceLetter] || "") : "";
   }
   return columns;
 }
@@ -2036,7 +2120,7 @@ function wrongbookExportHtml() {
 }
 
 function exportWrongbook() {
-  downloadText("个人错题本.doc", wrongbookExportHtml(), "application/msword;charset=utf-8");
+  downloadText(`${bankScopeLabel()}_个人错题本.doc`, wrongbookExportHtml(), "application/msword;charset=utf-8");
 }
 
 function printWrongbookPdf() {
@@ -2053,15 +2137,13 @@ function rowsForExcel(items, shuffleOptions = state.exportShuffleOptions) {
   return items.map((question) => {
     const order = optionOrderForExport(question, shuffleOptions);
     return {
-      难度层级: question.difficultyLayer,
-      知识分类: question.categoryPath.join("/"),
+      章节: question.categoryPath.join("/"),
       题型: question.questionType,
       题干: question.stem,
       ...optionColumnsForExport(question, order),
-      标准答案: answerLettersForExport(question, order),
+      正确答案: answerLettersForExport(question, order),
       解析: question.explanation || "",
-      知识点标签: question.tags.join("、"),
-      "来源/依据": question.source || "",
+      易错点标签: question.tags.join("、"),
     };
   });
 }
@@ -2080,54 +2162,61 @@ function exportExcel(filename, items) {
 }
 
 function exportFilteredExcel() {
-  exportExcel("当前筛选题库.xlsx", filteredQuestions());
+  exportExcel(`${bankScopeLabel()}_当前筛选题库.xlsx`, filteredQuestions());
 }
 
 function exportAllExcel() {
-  exportExcel("全库题库.xlsx", BANK);
+  exportExcel(`${bankScopeLabel()}_全部题库.xlsx`, BANK);
+}
+
+function rowField(row, ...names) {
+  for (const name of names) {
+    if (row[name] !== undefined && row[name] !== null && String(row[name]).trim() !== "") return row[name];
+  }
+  return "";
 }
 
 function validateImportedRow(row, index) {
   const errors = [];
-  const layer = String(row.难度层级 || "").trim();
-  const type = String(row.题型 || "").trim();
-  if (!SCHEMA.difficultyLayers.includes(layer)) errors.push(`第${index}行难度层级填写错误`);
-  if (!String(row.知识分类 || "").trim()) errors.push(`第${index}行知识分类不能为空`);
+  const type = String(rowField(row, "题型")).trim();
+  if (!String(rowField(row, "章节", "知识分类")).trim()) errors.push(`第${index}行章节不能为空`);
   if (!SCHEMA.questionTypes.includes(type)) errors.push(`第${index}行题型填写错误`);
-  if (!String(row.题干 || "").trim()) errors.push(`第${index}行题干不能为空`);
+  if (!String(rowField(row, "题干")).trim()) errors.push(`第${index}行题干不能为空`);
   if (["单选", "多选"].includes(type)) {
-    for (const letter of "ABCD") if (!String(row[`选项${letter}`] || "").trim()) errors.push(`第${index}行选项${letter}不能为空`);
-    if (!/^[A-F]+$/i.test(String(row.标准答案 || "").trim())) errors.push(`第${index}行标准答案应填写选项字母`);
+    for (const letter of "ABCD") if (!String(rowField(row, letter, `选项${letter}`)).trim()) errors.push(`第${index}行选项${letter}不能为空`);
+    if (!/^[A-F]+$/i.test(String(rowField(row, "正确答案", "标准答案")).trim())) errors.push(`第${index}行正确答案应填写选项字母`);
   }
-  if (type === "判断" && !/^(对|错|正确|错误|A|B)$/i.test(String(row.标准答案 || "").trim())) errors.push(`第${index}行判断题标准答案应填写对/错`);
-  if (type === "简答" && !String(row.标准答案 || "").trim()) errors.push(`第${index}行简答题标准答案不能为空`);
+  if (type === "判断" && !/^(对|错|正确|错误|A|B)$/i.test(String(rowField(row, "正确答案", "标准答案")).trim())) errors.push(`第${index}行判断题正确答案应填写正确/错误`);
+  if (type === "简答" && !String(rowField(row, "正确答案", "标准答案")).trim()) errors.push(`第${index}行简答题正确答案不能为空`);
   return errors;
 }
 
 function normalizeImportedRow(row, id) {
-  const type = String(row.题型).trim();
-  const answer = String(row.标准答案 || "").trim();
+  const type = String(rowField(row, "题型")).trim();
+  const answer = String(rowField(row, "正确答案", "标准答案")).trim();
   const letters = type === "简答" ? [] : type === "判断" ? (/^(对|正确|A)$/i.test(answer) ? ["A"] : ["B"]) : [...new Set((answer.toUpperCase().match(/[A-F]/g) || []))];
-  const options = type === "判断" ? { A: "对", B: "错" } : {};
+  const options = type === "判断" ? { A: String(rowField(row, "A", "选项A") || "正确").trim(), B: String(rowField(row, "B", "选项B") || "错误").trim() } : {};
   for (const letter of "ABCDEF") {
-    const text = String(row[`选项${letter}`] || "").trim();
+    const text = String(rowField(row, letter, `选项${letter}`)).trim();
     if (text) options[letter] = text;
   }
-  const categoryPath = String(row.知识分类 || "").split(/[\/／>＞\\|]+/).map((x) => x.trim()).filter(Boolean);
+  const categoryPath = String(rowField(row, "章节", "知识分类") || "").split(/[\/／>＞\\|]+/).map((x) => x.trim()).filter(Boolean);
   return {
     id,
     sourceId: `IMP${id}`,
-    difficultyLayer: String(row.难度层级).trim(),
+    bankScope: activeBankScope,
+    bankLabel: bankScopeLabel(),
+    difficultyLayer: "基础层",
     categoryPath,
     categoryKey: categoryPath.join(" / "),
     questionType: type,
-    stem: String(row.题干).trim(),
+    stem: String(rowField(row, "题干")).trim(),
     options,
     answerLetters: letters,
     answerText: answer,
-    explanation: String(row.解析 || "").trim(),
-    tags: String(row.知识点标签 || "").split(/[、,，;/；|]+/).map((x) => x.trim()).filter(Boolean),
-    source: String(row["来源/依据"] || "").trim(),
+    explanation: String(rowField(row, "解析")).trim(),
+    tags: String(rowField(row, "易错点标签", "知识点标签")).split(/[、,，;/；|]+/).map((x) => x.trim()).filter(Boolean),
+    source: String(rowField(row, "来源/依据")).trim(),
     autoScore: type !== "简答",
   };
 }
@@ -2140,12 +2229,12 @@ function importExcelBank(input) {
   reader.onload = () => {
     try {
       const wb = XLSX.read(reader.result, { type: "array" });
-      const required = ["难度层级", "知识分类", "题型", "题干", "标准答案"];
+      const required = ["章节", "题型", "题干", "正确答案"];
       let rows = null;
       for (const name of wb.SheetNames) {
         const sheetRows = XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: "" });
         const headers = sheetRows[0] ? Object.keys(sheetRows[0]) : [];
-        if (required.every((h) => headers.includes(h))) {
+        if (required.every((h) => headers.includes(h)) || ["知识分类", "题型", "题干", "标准答案"].every((h) => headers.includes(h))) {
           rows = sheetRows;
           break;
         }
@@ -2164,8 +2253,8 @@ function importExcelBank(input) {
         stems.add(stem);
       }
       const merged = [...sourceBank, ...imported];
-      writeJson(STORAGE.bankOverride, { questions: merged, importedAt: nowIso() });
-      alert(`导入完成：新增 ${imported.length} 题，重复题干已自动跳过。页面将刷新。`);
+      saveBankOverrideForScope(activeBankScope, merged);
+      alert(`导入完成：已导入到${bankScopeLabel()}，新增 ${imported.length} 题，重复题干已自动跳过。页面将刷新。`);
       location.reload();
     } catch (err) {
       showError(err.message || "导入失败。");
@@ -2236,6 +2325,11 @@ async function boot() {
     const user = users().find((u) => u.username === session.username);
     if (user) {
       state.user = { username: user.username, role: user.role || (user.username === "admin" ? "super" : "user") };
+      activeBankScope = savedBankScope(user.username);
+      state.selectedBankScope = activeBankScope;
+      BANK = loadBank();
+      indexBank();
+      resetCategorySelection();
       loadRound(user.username);
       syncRecords();
     }
