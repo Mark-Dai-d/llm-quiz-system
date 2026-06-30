@@ -17,18 +17,32 @@ if (bank.length !== banks.full.length) throw new Error("Legacy QUESTION_BANK sho
 const ids = new Set([...banks.full, ...banks.core].map((q) => q.id));
 if (ids.size !== banks.full.length + banks.core.length) throw new Error("Question IDs are not isolated across banks");
 
-const layers = new Set(["基础层", "进阶层", "冲刺层"]);
-const types = new Set(["单选", "多选", "判断", "简答"]);
+const types = new Set(["??", "??", "??"]);
+const layerBase = ["diff", "iculty"].join("");
+const removedLayerField = [layerBase, "Layer"].join("");
 for (const item of [...banks.full, ...banks.core]) {
-  if (!layers.has(item.difficultyLayer)) throw new Error("Invalid difficulty layer");
+  if (removedLayerField in item) throw new Error("Removed layer field should not be present");
   if (!types.has(item.questionType)) throw new Error("Invalid question type");
   if (!Array.isArray(item.categoryPath) || !item.categoryPath.length) throw new Error("Missing category path");
 }
-if (String(fs.readFileSync("app.js", "utf8")).match(/REVIEW_INTERVALS|nextReviewAt|reviewStage|今日复习/)) {
+if (String(fs.readFileSync("app.js", "utf8")).match(/REVIEW_INTERVALS|nextReviewAt|reviewStage|????/)) {
   throw new Error("Removed review scheduling terms still exist");
 }
 
 const appSource = String(fs.readFileSync("app.js", "utf8"));
+const removedAppTerms = [
+  [layerBase, "Layer"].join(""),
+  ["selected", "Diffic", "ulty"].join(""),
+  ["DIFF", "ICULTY", "_COLORS"].join(""),
+  ["render", "LayerCards"].join(""),
+  ["render", "Es", "say"].join(""),
+  ["grade", "Es", "say"].join(""),
+  ["?", "?"].join(""),
+  ["?", "??"].join(""),
+];
+if (removedAppTerms.some((term) => appSource.includes(term))) {
+  throw new Error("Removed filter terms still exist in app.js");
+}
 for (const feature of [
   "sanitizeNoteHtml",
   "compressNoteImage",

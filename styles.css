@@ -389,7 +389,6 @@ textarea {
 }
 
 .bank-scope-row,
-.difficulty-row,
 .type-row {
   display: flex;
   flex-wrap: wrap;
@@ -397,7 +396,6 @@ textarea {
 }
 
 .bank-scope-pill,
-.difficulty-pill,
 .check-chip {
   display: inline-flex;
   align-items: center;
@@ -410,8 +408,7 @@ textarea {
   color: var(--ink);
 }
 
-.bank-scope-pill span,
-.difficulty-pill span {
+.bank-scope-pill span {
   padding: 1px 7px;
   border-radius: 999px;
   background: #edf2f7;
@@ -420,7 +417,6 @@ textarea {
 }
 
 .bank-scope-pill.active,
-.difficulty-pill.active,
 .check-chip:has(input:checked) {
   border-color: var(--brand);
   box-shadow: 0 0 0 2px rgba(22, 103, 183, 0.12);
@@ -749,7 +745,7 @@ textarea {
 }
 
 .rich-editor:empty::before {
-  content: "写下知识点总结、易错提醒或解题技巧…";
+  content: "??????????????????";
   color: #98a2b3;
 }
 
@@ -820,10 +816,8 @@ textarea {
   border: 1px solid var(--line);
 }
 
-.essay-answer {
-  padding: 12px;
-  border-radius: 8px;
-  background: #fff8e6;
+.result-explanation {
+  margin-top: 8px;
   line-height: 1.8;
 }
 
