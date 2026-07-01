@@ -978,6 +978,46 @@ th {
   box-shadow: var(--shadow);
 }
 
+.edit-modal {
+  width: min(900px, 100%);
+}
+
+.edit-form {
+  margin-top: 12px;
+}
+
+.edit-options {
+  display: grid;
+  gap: 8px;
+}
+
+.edit-option-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 92px;
+  align-items: center;
+  gap: 8px;
+}
+
+.edit-option-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.edit-option-row input[type="radio"],
+.edit-option-row input[type="checkbox"] {
+  width: auto;
+}
+
+.edit-log-diff {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
 .modal-head,
 .modal-actions {
   display: flex;
@@ -1102,6 +1142,11 @@ th {
   .compact-question-item {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .edit-option-row,
+  .edit-log-diff {
+    grid-template-columns: 1fr;
   }
 }
 

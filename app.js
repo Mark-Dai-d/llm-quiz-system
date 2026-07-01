@@ -18,6 +18,7 @@ const STORAGE = {
   deletedQuestionIds: "llm_quiz_deleted_question_ids_v1",
   questionRecycleBin: "llm_quiz_question_recycle_bin_v1",
   questionDeleteLogs: "llm_quiz_question_delete_logs_v1",
+  questionEditLogs: "llm_quiz_question_edit_logs_v1",
   data: (username) => `llm_quiz_learning_v2_${username}`,
   round: (username, scope = activeBankScope) => `llm_quiz_round_v2_${normalizeBankScope(scope)}_${username}`,
 };
@@ -280,6 +281,7 @@ const state = {
   selectedPublicNoteIds: new Set(),
   selectedRecycleIds: new Set(),
   deleteTargetId: null,
+  editTargetId: null,
   insightScope: "filtered",
 };
 
@@ -412,6 +414,10 @@ function deleteLogs() {
   return readJson(STORAGE.questionDeleteLogs, []) || [];
 }
 
+function editLogs() {
+  return readJson(STORAGE.questionEditLogs, []) || [];
+}
+
 function purgeExpiredRecycleBin() {
   const now = Date.now();
   const current = recycleBin();
@@ -435,6 +441,23 @@ function appendDeleteLog(action, question, extra = {}) {
     ...extra,
   });
   writeJson(STORAGE.questionDeleteLogs, logs);
+}
+
+function appendEditLog(beforeQuestion, afterQuestion) {
+  const actor = state.user || {};
+  const logs = editLogs();
+  logs.unshift({
+    id: randomId(),
+    action: "edit",
+    questionId: Number(afterQuestion.id),
+    userId: actor.username || "system",
+    nickname: actor.nickname || actor.username || "系统",
+    role: actor.role || "system",
+    at: nowIso(),
+    before: questionSnapshot(beforeQuestion),
+    after: questionSnapshot(afterQuestion),
+  });
+  writeJson(STORAGE.questionEditLogs, logs);
 }
 
 function removeQuestionFromRound(round, questionId) {
@@ -532,6 +555,169 @@ function globalDeleteQuestion(questionId) {
   state.noteEditorId = null;
   reloadQuestionState();
   showToast("题目已全局删除，30 天内管理员可恢复");
+}
+
+function localUsernames() {
+  return uniq([...users().map((user) => user.username), state.user?.username].filter(Boolean));
+}
+
+function normalizeEditCategory(value) {
+  return String(value || "").split(/[\/／>＞\\|]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizeEditTags(value) {
+  return String(value || "").split(/[、,，;/；|]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function readEditedQuestionFromForm(original) {
+  const type = document.getElementById("edit-type")?.value;
+  if (!SCHEMA.questionTypes.includes(type)) throw new Error("题型只能选择单选、多选、判断。");
+  const categoryPath = normalizeEditCategory(document.getElementById("edit-category")?.value);
+  if (!categoryPath.length) throw new Error("章节/知识分类不能为空。");
+  const stem = String(document.getElementById("edit-stem")?.value || "").trim();
+  if (!stem) throw new Error("题干不能为空。");
+
+  const optionScope = type === "判断" ? "AB" : "ABCDEF";
+  const options = {};
+  for (const letter of optionScope) {
+    let text = String(document.getElementById(`edit-option-${letter}`)?.value || "").trim();
+    if (type === "判断" && !text) text = letter === "A" ? "正确" : "错误";
+    if (text) options[letter] = text;
+  }
+  if (type !== "判断" && Object.keys(options).length < 2) throw new Error("单选/多选至少需要保留 2 个选项。");
+
+  let answerLetters = [...optionScope].filter((letter) => document.getElementById(`edit-answer-${letter}`)?.checked);
+  answerLetters = answerLetters.filter((letter) => options[letter]);
+  if (type === "单选" && answerLetters.length !== 1) throw new Error("单选题必须且只能设置 1 个正确答案。");
+  if (type === "判断" && answerLetters.length !== 1) throw new Error("判断题必须且只能设置 1 个正确答案。");
+  if (type === "多选" && answerLetters.length < 1) throw new Error("多选题至少需要设置 1 个正确答案。");
+
+  const scope = normalizeBankScope(original.bankScope || activeBankScope);
+  return normalizeQuestion({
+    ...original,
+    bankScope: scope,
+    bankLabel: bankScopeLabel(scope),
+    categoryPath,
+    categoryKey: categoryPath.join(" / "),
+    questionType: type,
+    stem,
+    options,
+    answerLetters,
+    answerText: answerLetters.join(""),
+    explanation: String(document.getElementById("edit-explanation")?.value || "").trim(),
+    tags: normalizeEditTags(document.getElementById("edit-tags")?.value),
+    autoScore: true,
+  }, 0, scope);
+}
+
+function recalibrateUserDataForQuestion(username, question) {
+  const d = data(username);
+  let changed = false;
+  d.answerLog = (d.answerLog || []).map((item) => {
+    if (Number(item.questionId) !== Number(question.id)) return item;
+    changed = true;
+    return { ...item, correct: isCorrect(question, item.selected || []) };
+  });
+  if (changed) {
+    d.records = rebuildRecords(d.answerLog, d.mastery);
+    saveData(d, username);
+  }
+}
+
+function refreshRoundsForEditedQuestion(question) {
+  const valid = new Set(optionLetters(question));
+  for (const username of localUsernames()) {
+    for (const scope of bankScopeKeys()) {
+      const roundKey = STORAGE.round(username, scope);
+      const round = readJson(roundKey, null);
+      if (!round?.questionIds?.some((id) => Number(id) === Number(question.id))) continue;
+      round.optionOrders ||= {};
+      round.optionOrders[String(question.id)] = randomOptionOrder(question);
+      const ans = round.answers?.[String(question.id)];
+      if (ans) {
+        let selected = (ans.selected || []).filter((letter) => valid.has(letter));
+        if (question.questionType !== "多选") selected = selected.slice(0, 1);
+        ans.selected = selected;
+        if (ans.submitted) {
+          if (selected.length) {
+            ans.correct = isCorrect(question, selected);
+            ans.dirty = false;
+          } else {
+            ans.submitted = false;
+            ans.dirty = false;
+            delete ans.correct;
+          }
+        }
+      }
+      round.updatedAt = nowIso();
+      writeJson(roundKey, round);
+    }
+  }
+}
+
+function openGlobalEdit(questionId) {
+  if (!q(questionId)) return showError("该题目已被删除或不存在。");
+  state.editTargetId = Number(questionId);
+  clearError();
+  render();
+}
+
+function closeGlobalEdit() {
+  state.editTargetId = null;
+  clearError();
+  render();
+}
+
+function syncEditFormType() {
+  const type = document.getElementById("edit-type")?.value || "单选";
+  const isMulti = type === "多选";
+  const scope = type === "判断" ? "AB" : "ABCDEF";
+  for (const letter of "ABCDEF") {
+    const row = document.getElementById(`edit-option-row-${letter}`);
+    const input = document.getElementById(`edit-option-${letter}`);
+    const answer = document.getElementById(`edit-answer-${letter}`);
+    if (!row || !input || !answer) continue;
+    const visible = scope.includes(letter);
+    row.style.display = visible ? "grid" : "none";
+    answer.type = isMulti ? "checkbox" : "radio";
+    answer.name = isMulti ? `edit-answer-${letter}` : "edit-answer";
+    answer.disabled = !visible;
+    input.disabled = !visible;
+    if (type === "判断" && letter === "A" && !input.value.trim()) input.value = "正确";
+    if (type === "判断" && letter === "B" && !input.value.trim()) input.value = "错误";
+    if (!visible) answer.checked = false;
+  }
+  if (!isMulti) {
+    const checked = [...document.querySelectorAll(".edit-answer")].filter((item) => item.checked && !item.disabled);
+    checked.slice(1).forEach((item) => { item.checked = false; });
+  }
+}
+
+function confirmGlobalEdit(questionId) {
+  const original = q(questionId);
+  if (!original) return showError("该题目已被删除或不存在。");
+  try {
+    const edited = readEditedQuestionFromForm(original);
+    const scope = normalizeBankScope(original.bankScope || activeBankScope);
+    const previousScope = activeBankScope;
+    activeBankScope = scope;
+    const sourceBank = loadBankSource();
+    activeBankScope = previousScope;
+    if (!sourceBank.some((question) => Number(question.id) === Number(original.id))) {
+      return showError("题库源中未找到该题，无法编辑。");
+    }
+    const merged = sourceBank.map((question) => Number(question.id) === Number(edited.id) ? edited : question);
+    saveBankOverrideForScope(scope, merged);
+    appendEditLog(original, edited);
+    for (const username of localUsernames()) recalibrateUserDataForQuestion(username, edited);
+    refreshRoundsForEditedQuestion(edited);
+    state.editTargetId = null;
+    reloadQuestionState();
+    clearError();
+    showToast("题目已全局更新，历史作答统计已按新答案重算");
+  } catch (error) {
+    showError(error.message || "题目编辑失败。");
+  }
 }
 
 function skipCurrentQuestion() {
@@ -1419,6 +1605,14 @@ function globalDeleteButton(questionId, small = true) {
   return `<button class="btn danger-outline ${small ? "small" : ""}" onclick="openGlobalDelete(${Number(questionId)})" title="从本设备公共题库及所有本地账号中删除">永久删除本题（全局生效）</button>`;
 }
 
+function globalEditButton(questionId, small = true) {
+  return `<button class="btn secondary ${small ? "small" : ""}" onclick="openGlobalEdit(${Number(questionId)})" title="修改公共题库源题目并保留个人学习记录">全局编辑本题（全局生效）</button>`;
+}
+
+function questionAdminButtons(questionId, small = true) {
+  return `${globalEditButton(questionId, small)}${globalDeleteButton(questionId, small)}`;
+}
+
 function renderQuestionSnapshot(question) {
   if (!question) return "";
   const options = Object.entries(question.options || {}).map(([letter, text]) => `<li><b>${esc(letter)}.</b> ${esc(text)}</li>`).join("");
@@ -1431,6 +1625,69 @@ function renderQuestionSnapshot(question) {
       <b>${esc(question.stem)}</b>
       ${options ? `<ol class="snapshot-options">${options}</ol>` : ""}
       <div class="muted">标准答案：${esc(answerText(question))}</div>
+    </div>`;
+}
+
+function renderEditOptionRow(question, letter) {
+  const type = question.questionType;
+  const isVisible = type !== "判断" || "AB".includes(letter);
+  const isMulti = type === "多选";
+  return `
+    <div id="edit-option-row-${letter}" class="edit-option-row" style="${isVisible ? "" : "display:none"}">
+      <b>${letter}</b>
+      <input id="edit-option-${letter}" value="${esc(question.options?.[letter] || "")}" placeholder="选项${letter}文本，留空表示删除" ${isVisible ? "" : "disabled"}>
+      <label><input id="edit-answer-${letter}" class="edit-answer" type="${isMulti ? "checkbox" : "radio"}" name="${isMulti ? `edit-answer-${letter}` : "edit-answer"}" value="${letter}" ${question.answerLetters?.includes(letter) ? "checked" : ""} ${isVisible ? "" : "disabled"}> 正确</label>
+    </div>`;
+}
+
+function renderEditModal() {
+  const question = q(state.editTargetId);
+  if (!question) return "";
+  return `
+    <div class="modal-backdrop" role="presentation" onclick="if(event.target===this) closeGlobalEdit()">
+      <section class="modal edit-modal" role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+        <div class="modal-head">
+          <h3 id="edit-modal-title">全局编辑本题</h3>
+          <button class="modal-close" onclick="closeGlobalEdit()" aria-label="关闭">×</button>
+        </div>
+        <div class="hint">编辑会修改公共题库源数据，题目 ID 保持不变；收藏、备注、错题记录保留，历史作答会按新答案重新判定。</div>
+        <div class="edit-form">
+          <div class="field">
+            <label>章节 / 知识分类</label>
+            <input id="edit-category" value="${esc(question.categoryPath.join("/"))}" placeholder="例如：第一章/第一节">
+          </div>
+          <div class="field">
+            <label>题型</label>
+            <select id="edit-type" onchange="syncEditFormType()">
+              ${SCHEMA.questionTypes.map((type) => `<option value="${type}" ${question.questionType === type ? "selected" : ""}>${type}</option>`).join("")}
+            </select>
+          </div>
+          <div class="field">
+            <label>题干</label>
+            <textarea id="edit-stem" rows="4">${esc(question.stem)}</textarea>
+          </div>
+          <div class="field">
+            <label>选项与正确答案</label>
+            <div class="edit-options">
+              ${"ABCDEF".split("").map((letter) => renderEditOptionRow(question, letter)).join("")}
+            </div>
+            <p class="muted">单选/判断只能勾选 1 个正确项；多选可勾选多个。非判断题留空的选项会从题目中删除。</p>
+          </div>
+          <div class="field">
+            <label>解析 / 考点</label>
+            <textarea id="edit-explanation" rows="4">${esc(question.explanation || "")}</textarea>
+          </div>
+          <div class="field">
+            <label>易错点标签 / 考点标签</label>
+            <input id="edit-tags" value="${esc((question.tags || []).join("、"))}" placeholder="多个标签可用顿号、逗号或分号分隔">
+          </div>
+        </div>
+        ${state.error ? `<div class="error">${esc(state.error)}</div>` : ""}
+        <div class="modal-actions">
+          <button class="btn ghost" onclick="closeGlobalEdit()">取消</button>
+          <button class="btn primary" onclick="confirmGlobalEdit(${question.id})">保存并全局生效</button>
+        </div>
+      </section>
     </div>`;
 }
 
@@ -1479,6 +1736,7 @@ function renderLayout(content) {
       </aside>
       <main class="main">${content}</main>
       ${state.toast ? `<div class="toast">${esc(state.toast)}</div>` : ""}
+      ${renderEditModal()}
       ${renderDeleteModal()}
     </div>
   `;
@@ -1565,7 +1823,7 @@ function renderFilteredQuestionPreview() {
           </div>
           <div class="inline-actions">
             <button class="btn secondary small" onclick="startRound('hierarchy',[${question.id}])">打开原题</button>
-            ${globalDeleteButton(question.id)}
+            ${questionAdminButtons(question.id)}
           </div>
         </div>`).join("")}</div>` : `<div class="empty">当前筛选下没有题目。</div>`}
     </section>`;
@@ -1610,7 +1868,7 @@ function renderRound() {
           <button class="btn secondary" onclick="gotoQuestion(1)" ${index === total - 1 ? "disabled" : ""}>下一题</button>
           ${index === total - 1 ? `<button class="btn ghost" onclick="endRound()">完成本轮</button>` : ""}
           <button class="btn ghost" onclick="skipCurrentQuestion()">本轮剔除本题</button>
-          ${globalDeleteButton(question.id, false)}
+          ${questionAdminButtons(question.id, false)}
         </div>
       </article>
     </div>
@@ -1740,7 +1998,7 @@ function renderQuestionList(items, source = "wrong") {
         <button class="btn ghost small" onclick="toggleFavorite(${question.id})">${isFavorited(question.id) ? "★ 已收藏" : "☆ 收藏"}</button>
         <button class="btn ghost small" onclick="markMastered(${question.id}, ${!rec.mastered})">${rec.mastered ? "标记未掌握" : "标记已掌握"}</button>
         <button class="btn ghost small" onclick="state.noteEditorId=${question.id};render()">备注</button>
-        ${globalDeleteButton(question.id)}
+        ${questionAdminButtons(question.id)}
       </div>
       ${state.noteEditorId === question.id ? renderNote(question.id) : ""}
       ${renderPublicNotes(question.id)}
@@ -1852,7 +2110,7 @@ function renderMyPublicNotes() {
               <button class="btn ghost small" onclick="toggleNotePublic(${note.questionId}, false)">关闭公开</button>
               <button class="btn secondary small" onclick="state.view='practice';startRound('hierarchy',[${note.questionId}])">打开原题</button>
               <button class="btn ghost small" onclick="state.noteEditorId=${note.questionId};state.view='practice';startRound('hierarchy',[${note.questionId}])">编辑备注</button>
-              ${globalDeleteButton(note.questionId)}
+              ${questionAdminButtons(note.questionId)}
             </div>
           </div>
         </article>`;
@@ -1881,7 +2139,7 @@ function statsTable(rows) {
 }
 
 function topWrongTable(items) {
-  return `<div class="table-wrap"><table><thead><tr><th>题目</th><th>错次</th><th>操作</th></tr></thead><tbody>${items.map((question) => `<tr><td><span class="badge">${esc(question.questionType)}</span> <span class="badge">${esc(question.categoryKey)}</span><br>${esc(compact(question.stem, 90))}</td><td>${question.wrongCount}</td><td><div class="inline-actions"><button class="btn small secondary" onclick="startRound('wrong',[${question.id}])">再刷</button>${globalDeleteButton(question.id)}</div></td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>题目</th><th>错次</th><th>操作</th></tr></thead><tbody>${items.map((question) => `<tr><td><span class="badge">${esc(question.questionType)}</span> <span class="badge">${esc(question.categoryKey)}</span><br>${esc(compact(question.stem, 90))}</td><td>${question.wrongCount}</td><td><div class="inline-actions"><button class="btn small secondary" onclick="startRound('wrong',[${question.id}])">再刷</button>${questionAdminButtons(question.id)}</div></td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function chapterRankingTable(limit = 12) {
@@ -1987,6 +2245,23 @@ function renderDeleteLogs() {
     </section>`;
 }
 
+function renderEditLogs() {
+  const logs = editLogs();
+  return `
+    <section class="panel admin-wide">
+      <h3>全局编辑操作日志</h3>
+      <p class="muted">记录修改人、时间、修改前题目和修改后题目，用于回溯答案、题干、章节和选项变更。当前显示最近 ${Math.min(logs.length, 100)} / ${logs.length} 条。</p>
+      ${logs.length ? `<div class="log-list">${logs.slice(0, 100).map((log) => `
+        <details class="log-item">
+          <summary><span class="badge good">编辑</span> 题目 #${Number(log.questionId)} · ${esc(log.nickname || log.userId)}（${esc(log.userId)}） · ${fmtTime(log.at)} · ${esc(compact(log.after?.stem || log.before?.stem, 90))}</summary>
+          <div class="edit-log-diff">
+            <div><b>修改前</b>${renderQuestionSnapshot(log.before)}</div>
+            <div><b>修改后</b>${renderQuestionSnapshot(log.after)}</div>
+          </div>
+        </details>`).join("")}</div>` : `<div class="empty">暂无编辑操作日志。</div>`}
+    </section>`;
+}
+
 function renderAdmin() {
   if (state.user.role !== "super") return pageTitle("本地管理", "普通用户无题库管理权限") + `<div class="empty">只有管理员可以查看本页。</div>`;
   return pageTitle("本地管理", "Excel 模板导入导出、题库备份、回收站与删除审计") + `
@@ -2022,6 +2297,7 @@ function renderAdmin() {
       </section>
     </div>
     ${renderRecycleBin()}
+    ${renderEditLogs()}
     ${renderDeleteLogs()}
   `;
 }
@@ -2303,7 +2579,7 @@ window.addEventListener("storage", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
-  if (!state.user || !state.round || state.deleteTargetId || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (!state.user || !state.round || state.deleteTargetId || state.editTargetId || event.ctrlKey || event.metaKey || event.altKey) return;
   const target = event.target;
   const tag = target?.tagName;
   if (target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(tag)) return;
