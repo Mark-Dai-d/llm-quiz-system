@@ -22,6 +22,13 @@ BANK_CONFIGS = [
         "id_offset": 300000,
         "expected": 154,
     },
+    {
+        "key": "cram",
+        "label": "考前冲刺题库",
+        "input": Path(r"C:\Users\14274\Desktop\毛概标注重点题库_练习版.xlsx"),
+        "id_offset": 400000,
+        "expected": 172,
+    },
 ]
 
 OUTPUT_JS = Path(__file__).with_name("data.js")

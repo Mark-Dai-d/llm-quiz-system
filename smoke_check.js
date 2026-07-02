@@ -10,17 +10,21 @@ const bank = context.window.QUESTION_BANK;
 const meta = context.window.QUESTION_META;
 
 if (!Array.isArray(bank)) throw new Error("QUESTION_BANK missing");
-if (!banks?.full || !banks?.core) throw new Error("QUESTION_BANKS full/core missing");
+if (!banks?.full || !banks?.core || !banks?.cram) throw new Error("QUESTION_BANKS full/core/cram missing");
 if (banks.full.length !== 786) throw new Error(`Expected 786 full questions, got ${banks.full.length}`);
 if (banks.core.length !== 154) throw new Error(`Expected 154 core questions, got ${banks.core.length}`);
+if (banks.cram.length !== 172) throw new Error(`Expected 172 cram questions, got ${banks.cram.length}`);
 if (bank.length !== banks.full.length) throw new Error("Legacy QUESTION_BANK should point to full bank");
-const ids = new Set([...banks.full, ...banks.core].map((q) => q.id));
-if (ids.size !== banks.full.length + banks.core.length) throw new Error("Question IDs are not isolated across banks");
+const allQuestions = [...banks.full, ...banks.core, ...banks.cram];
+const ids = new Set(allQuestions.map((q) => q.id));
+if (ids.size !== allQuestions.length) throw new Error("Question IDs are not isolated across banks");
+if ((meta.bankScopes || []).length !== 3) throw new Error("Expected three bank scopes");
+if (!meta.bankScopes.some((scope) => scope.key === "cram" && scope.count === 172)) throw new Error("Cram bank scope missing or wrong count");
 
 const types = new Set(["单选", "多选", "判断"]);
 const layerBase = ["diff", "iculty"].join("");
 const removedLayerField = [layerBase, "Layer"].join("");
-for (const item of [...banks.full, ...banks.core]) {
+for (const item of allQuestions) {
   if (removedLayerField in item) throw new Error("Removed layer field should not be present");
   if (!types.has(item.questionType)) throw new Error("Invalid question type");
   if (!Array.isArray(item.categoryPath) || !item.categoryPath.length) throw new Error("Missing category path");
@@ -74,5 +78,6 @@ for (const feature of [
 console.log("smoke ok", {
   full: banks.full.length,
   core: banks.core.length,
+  cram: banks.cram.length,
   scopes: meta.bankScopes,
 });
