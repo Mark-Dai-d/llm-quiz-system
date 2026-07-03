@@ -186,18 +186,18 @@ function deletedQuestionIds() {
   return new Set((readJson(STORAGE.deletedQuestionIds, []) || []).map(Number).filter(Number.isFinite));
 }
 
-function loadBankSource() {
+function loadBankSource(scope = activeBankScope) {
   const override = readJson(STORAGE.bankOverride, null);
-  const scope = activeBankScope;
-  const source = override?.banks?.[scope]?.length
-    ? override.banks[scope]
-    : window.QUESTION_BANKS?.[scope] || (scope === DEFAULT_BANK_SCOPE ? (window.QUESTION_BANK || []) : []);
-  return source.map((question, index) => normalizeQuestion(question, index, scope));
+  const normalizedScope = normalizeBankScope(scope);
+  const source = override?.banks?.[normalizedScope]?.length
+    ? override.banks[normalizedScope]
+    : window.QUESTION_BANKS?.[normalizedScope] || (normalizedScope === DEFAULT_BANK_SCOPE ? (window.QUESTION_BANK || []) : []);
+  return source.map((question, index) => normalizeQuestion(question, index, normalizedScope));
 }
 
-function loadBank() {
+function loadBank(scope = activeBankScope) {
   const deletedIds = deletedQuestionIds();
-  return loadBankSource().filter((question) => !deletedIds.has(question.id));
+  return loadBankSource(scope).filter((question) => !deletedIds.has(question.id));
 }
 
 function saveBankOverrideForScope(scope, questions) {
@@ -958,12 +958,17 @@ function countLabel() {
 }
 
 function favoriteItems(d = data()) {
+  const seen = new Set();
   return (d.favorites || [])
     .map((item) => ({
       questionId: Number(typeof item === "object" ? item.questionId : item),
       createdAt: typeof item === "object" ? item.createdAt : nowIso(),
     }))
-    .filter((item) => q(item.questionId));
+    .filter((item) => {
+      if (!Number.isFinite(item.questionId) || seen.has(item.questionId)) return false;
+      seen.add(item.questionId);
+      return true;
+    });
 }
 
 function favoriteSet(d = data()) {
@@ -2009,7 +2014,27 @@ function renderQuestionList(items, source = "wrong") {
 function renderFavorites() {
   const fav = favoriteSet();
   const items = BANK.filter((question) => fav.has(question.id)).sort((a, b) => a.categoryKey.localeCompare(b.categoryKey, "zh-CN") || a.id - b.id);
-  return pageTitle("我的收藏", `${bankScopeLabel()} · 收藏与备注互不覆盖，可集中复盘重点题`, `<button class="btn primary" onclick="startRound('favorite',[...favoriteSet()])">刷收藏题</button><button class="btn danger" onclick="clearFavorites()">批量取消收藏</button>`) + (items.length ? renderGroupedQuestions(items) : `<div class="empty">当前题库范围还没有收藏题目。</div>`);
+  return pageTitle("我的收藏", `${bankScopeLabel()} · 收藏与备注互不覆盖，可集中复盘重点题`, `<button class="btn primary" onclick="startRound('favorite',[...favoriteSet()])">刷收藏题</button><button class="btn danger" onclick="clearFavorites()">批量取消收藏</button>`) + (items.length ? renderGroupedQuestions(items) : renderFavoriteEmptyState());
+}
+
+function favoriteScopeSummaries() {
+  const fav = favoriteSet();
+  return BANK_SCOPE_CONFIGS.map((scope) => {
+    const questions = scope.key === activeBankScope ? BANK : loadBank(scope.key);
+    const count = questions.filter((question) => fav.has(question.id)).length;
+    return { key: scope.key, label: scope.label, count };
+  }).filter((item) => item.count > 0);
+}
+
+function renderFavoriteEmptyState() {
+  const summaries = favoriteScopeSummaries().filter((item) => item.key !== activeBankScope);
+  if (!summaries.length) return `<div class="empty">当前题库范围还没有收藏题目。</div>`;
+  return `<div class="empty">
+    <p>当前题库范围没有收藏题目，但其他题库范围还保留着收藏。</p>
+    <div class="inline-actions" style="justify-content:center;margin-top:12px">
+      ${summaries.map((item) => `<button class="btn secondary" onclick="setBankScope('${item.key}')">切换到${esc(item.label)}：${item.count} 题</button>`).join("")}
+    </div>
+  </div>`;
 }
 
 function renderGroupedQuestions(items, source = "favorite") {
