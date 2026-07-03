@@ -26,8 +26,11 @@ BANK_CONFIGS = [
         "key": "cram",
         "label": "考前冲刺题库",
         "input": Path(r"C:\Users\14274\Desktop\毛概标注重点题库_练习版.xlsx"),
+        "append_inputs": [
+            Path(r"C:\Users\14274\Downloads\毛概线上期末测试题库_两批整理版.xlsx"),
+        ],
         "id_offset": 400000,
-        "expected": 172,
+        "expected": 205,
     },
 ]
 
@@ -42,6 +45,10 @@ def clean(value):
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def stem_key(value):
+    return re.sub(r"\s+", "", clean(value))
 
 
 def split_path(value):
@@ -139,7 +146,7 @@ def normalize_row(raw, row_index, bank_key, bank_label, id_offset):
             "A": options.get("A") or "正确",
             "B": options.get("B") or "错误",
         }
-    source_id = clean(raw.get("题号")) or f"{bank_key.upper()}{row_index:03d}"
+    source_id = clean(raw.get("题号") or raw.get("原题号") or raw.get("序号")) or f"{bank_key.upper()}{row_index:03d}"
     return {
         "id": id_offset + row_index,
         "sourceId": source_id,
@@ -154,30 +161,48 @@ def normalize_row(raw, row_index, bank_key, bank_label, id_offset):
         "answerText": answer,
         "explanation": clean(raw.get("解析")),
         "tags": split_tags(raw.get("易错点标签") or raw.get("知识点标签")),
-        "source": clean(raw.get("来源/依据")),
+        "source": clean(raw.get("来源/依据") or raw.get("来源批次")),
         "autoScore": True,
     }
 
 
-def load_bank(config):
-    wb = openpyxl.load_workbook(config["input"], data_only=True)
+def load_questions_from_file(path, config, existing_questions, seen_stems, skip_duplicates=False):
+    wb = openpyxl.load_workbook(path, data_only=True)
     ws = find_question_sheet(wb)
-    questions = []
+    loaded = []
     errors = []
+    skipped = 0
     for row in range(2, ws.max_row + 1):
         raw = row_dict(ws, row)
         if not any(clean(v) for v in raw.values()):
             continue
-        q = normalize_row(raw, len(questions) + 1, config["key"], config["label"], config["id_offset"])
+        q = normalize_row(raw, len(existing_questions) + len(loaded) + 1, config["key"], config["label"], config["id_offset"])
+        key = stem_key(q["stem"])
+        if skip_duplicates and key in seen_stems:
+            skipped += 1
+            continue
         row_errors = validate_question(q, row, config["label"])
         if row_errors:
             errors.extend(row_errors)
             continue
-        questions.append(q)
+        loaded.append(q)
+        if key:
+            seen_stems.add(key)
     if errors:
         raise ValueError("\n".join(errors[:80]))
+    return loaded, skipped
+
+
+def load_bank(config):
+    questions = []
+    seen_stems = set()
+    total_skipped = 0
+    for index, path in enumerate([config["input"], *config.get("append_inputs", [])]):
+        loaded, skipped = load_questions_from_file(path, config, questions, seen_stems, skip_duplicates=index > 0)
+        questions.extend(loaded)
+        total_skipped += skipped
     if config.get("expected") and len(questions) != config["expected"]:
-        raise ValueError(f"{config['label']} 题量应为 {config['expected']}，实际为 {len(questions)}")
+        raise ValueError(f"{config['label']} 题量应为 {config['expected']}，实际为 {len(questions)}，去重跳过 {total_skipped}")
     return questions
 
 

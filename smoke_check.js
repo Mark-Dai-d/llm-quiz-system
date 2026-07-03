@@ -13,13 +13,13 @@ if (!Array.isArray(bank)) throw new Error("QUESTION_BANK missing");
 if (!banks?.full || !banks?.core || !banks?.cram) throw new Error("QUESTION_BANKS full/core/cram missing");
 if (banks.full.length !== 786) throw new Error(`Expected 786 full questions, got ${banks.full.length}`);
 if (banks.core.length !== 154) throw new Error(`Expected 154 core questions, got ${banks.core.length}`);
-if (banks.cram.length !== 172) throw new Error(`Expected 172 cram questions, got ${banks.cram.length}`);
+if (banks.cram.length !== 205) throw new Error(`Expected 205 cram questions, got ${banks.cram.length}`);
 if (bank.length !== banks.full.length) throw new Error("Legacy QUESTION_BANK should point to full bank");
 const allQuestions = [...banks.full, ...banks.core, ...banks.cram];
 const ids = new Set(allQuestions.map((q) => q.id));
 if (ids.size !== allQuestions.length) throw new Error("Question IDs are not isolated across banks");
 if ((meta.bankScopes || []).length !== 3) throw new Error("Expected three bank scopes");
-if (!meta.bankScopes.some((scope) => scope.key === "cram" && scope.count === 172)) throw new Error("Cram bank scope missing or wrong count");
+if (!meta.bankScopes.some((scope) => scope.key === "cram" && scope.count === 205)) throw new Error("Cram bank scope missing or wrong count");
 
 const types = new Set(["单选", "多选", "判断"]);
 const layerBase = ["diff", "iculty"].join("");
